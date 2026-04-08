@@ -26,7 +26,8 @@ from typing import Optional
 class ParsedRequest:
     trace_id: str
     timestamp: str
-    prompt: str          # full concatenated message content
+    messages: list       # raw messages list (OpenAI chat format)
+    prompt: str          # flattened text for fuzzy matching in session analysis
     model: str = ""
 
 
@@ -72,26 +73,37 @@ def _parse_request_body(entry: dict) -> Optional[dict]:
         return None
 
 
-def _extract_prompt_from_body(body: dict) -> Optional[str]:
-    """Extract the full prompt text from a parsed request body."""
-    # Simple prompt field
+def _extract_messages_from_body(body: dict) -> Optional[tuple[list, str]]:
+    """
+    Extract messages and a flattened prompt string from a parsed request body.
+
+    Returns (messages, prompt_text) where messages is the raw OpenAI-format
+    list and prompt_text is a flattened string for fuzzy matching.
+    Returns None if the body cannot be parsed.
+    """
+    # Simple prompt field — no messages to apply chat template to
     if "prompt" in body and isinstance(body["prompt"], str) and body["prompt"]:
-        return body["prompt"]
+        prompt = body["prompt"]
+        return [{"role": "user", "content": prompt}], prompt
 
     # Messages array (OpenAI format)
     messages = body.get("messages")
     if not isinstance(messages, list):
         return None
 
-    parts = []
+    # Validate messages and build flattened text for fuzzy matching
+    clean_messages = []
+    text_parts = []
     for msg in messages:
+        role = msg.get("role", "")
         content = msg.get("content")
         if isinstance(content, str):
             if content:
-                parts.append(content)
+                clean_messages.append({"role": role, "content": content})
+                text_parts.append(content)
         elif isinstance(content, list):
             # Array of content parts — skip multimodal
-            text_parts = []
+            parts = []
             for item in content:
                 if not isinstance(item, dict):
                     continue
@@ -99,12 +111,16 @@ def _extract_prompt_from_body(body: dict) -> Optional[str]:
                     return None  # multimodal, skip entire request
                 t = item.get("text", "")
                 if t:
-                    text_parts.append(t)
-            if text_parts:
-                parts.append("".join(text_parts))
+                    parts.append(t)
+            if parts:
+                joined = "".join(parts)
+                clean_messages.append({"role": role, "content": joined})
+                text_parts.append(joined)
 
-    prompt = "\n".join(parts)
-    return prompt if prompt else None
+    if not clean_messages:
+        return None
+
+    return clean_messages, "\n".join(text_parts)
 
 
 def parse_log_file(path: str) -> list[ParsedRequest]:
@@ -130,12 +146,13 @@ def parse_log_file(path: str) -> list[ParsedRequest]:
                 errors += 1
                 continue
 
-            prompt = _extract_prompt_from_body(body)
-            if prompt is None:
+            result = _extract_messages_from_body(body)
+            if result is None:
                 # Could be multimodal skip or just empty
                 skipped_multimodal += 1
                 continue
 
+            messages, prompt_text = result
             trace_id = entry.get("trace_id", f"line_{lineno}")
             timestamp = entry.get("__TIMESTAMP__", entry.get("ts", ""))
             model = entry.get("model_name", body.get("model", ""))
@@ -143,7 +160,8 @@ def parse_log_file(path: str) -> list[ParsedRequest]:
             requests.append(ParsedRequest(
                 trace_id=trace_id,
                 timestamp=str(timestamp),
-                prompt=prompt,
+                messages=messages,
+                prompt=prompt_text,
                 model=model,
             ))
 
@@ -180,11 +198,22 @@ def load_tokenizer(path: str):
 def tokenize_requests(
     tokenizer, requests: list[ParsedRequest]
 ) -> list[list[int]]:
-    """Tokenize all prompts. Returns list of token-id lists."""
+    """Tokenize all requests using chat template. Returns list of token-id lists."""
     t0 = time.time()
     token_lists = []
+    fallback_count = 0
     for i, req in enumerate(requests):
-        ids = tokenizer.encode(req.prompt, add_special_tokens=False)
+        try:
+            ids = tokenizer.apply_chat_template(
+                req.messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=False,
+            )
+        except Exception:
+            # Fallback: encode the flattened prompt if chat template fails
+            ids = tokenizer.encode(req.prompt, add_special_tokens=False)
+            fallback_count += 1
         token_lists.append(ids)
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
@@ -195,9 +224,10 @@ def tokenize_requests(
             )
     elapsed = time.time() - t0
     total_tokens = sum(len(t) for t in token_lists)
+    fallback_msg = f", {fallback_count} fallback" if fallback_count else ""
     print(
         f"\r  tokenized {len(token_lists)} requests, "
-        f"{total_tokens:,} total tokens in {elapsed:.1f}s"
+        f"{total_tokens:,} total tokens in {elapsed:.1f}s{fallback_msg}"
     )
     return token_lists
 
