@@ -10,7 +10,7 @@ import argparse
 import difflib
 import hashlib
 import json
-import struct
+import pickle
 import sys
 import time
 from collections import OrderedDict, defaultdict
@@ -233,26 +233,53 @@ def tokenize_requests(
 
 
 # ---------------------------------------------------------------------------
-# Chained-hash block key generation
+# Chained-hash block key generation (aligned with vLLM)
 # ---------------------------------------------------------------------------
 
-def compute_block_keys(token_ids: list[int], block_size: int) -> list[int]:
+# vLLM's NONE_HASH is the parent hash for the first block.
+# In production it's either random or hash_fn(PYTHONHASHSEED).
+# For reproducible simulation, we use a fixed seed.
+_NONE_HASH = hashlib.sha256(
+    pickle.dumps("prefix_cache_simulator_none_hash",
+                 protocol=pickle.HIGHEST_PROTOCOL)
+).digest()
+
+
+def _hash_block_tokens(
+    parent_block_hash: bytes,
+    curr_block_token_ids: tuple[int, ...],
+    extra_keys: tuple | None = None,
+) -> bytes:
+    """
+    Compute block hash matching vLLM's hash_block_tokens (sha256 default).
+
+    See vllm/vllm/v1/core/kv_cache_utils.py::hash_block_tokens
+    and vllm/vllm/utils/hashing.py::sha256.
+    """
+    input_bytes = pickle.dumps(
+        (parent_block_hash, curr_block_token_ids, extra_keys),
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    return hashlib.sha256(input_bytes).digest()
+
+
+def compute_block_keys(token_ids: list[int], block_size: int) -> list[bytes]:
     """
     Split token_ids into blocks of block_size and produce a chained hash key
     for each block.  Block i's key depends on all blocks 0..i (prefix-dependent).
 
-    Returns a list of integer keys, one per block.
+    Uses the same hashing scheme as vLLM's prefix caching (sha256 over
+    pickle-serialized (parent_hash, token_ids_tuple, extra_keys)).
+
+    Returns a list of bytes keys, one per block.
     """
     keys = []
-    prev_key = 0  # initial chain value
+    prev_hash = _NONE_HASH
     for start in range(0, len(token_ids), block_size):
-        block = token_ids[start : start + block_size]
-        # Pack: prev_key (8 bytes) + each token as 4-byte int
-        data = struct.pack(f"<Q{len(block)}I", prev_key, *block)
-        h = hashlib.blake2b(data, digest_size=8).digest()
-        key = struct.unpack("<Q", h)[0]
-        keys.append(key)
-        prev_key = key
+        block = tuple(token_ids[start : start + block_size])
+        block_hash = _hash_block_tokens(prev_hash, block)
+        keys.append(block_hash)
+        prev_hash = block_hash
     return keys
 
 
@@ -268,7 +295,7 @@ class LRUPrefixCache:
 
     def __init__(self, capacity_blocks: int):
         self.capacity = capacity_blocks
-        self.cache: OrderedDict[int, None] = OrderedDict()
+        self.cache: OrderedDict[bytes, None] = OrderedDict()
 
     def query(
         self, block_keys: list[int], block_size: int
