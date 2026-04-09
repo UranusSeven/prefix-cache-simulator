@@ -44,15 +44,8 @@ python prefix_cache_simulator.py <log.jsonl> \
 
 ### `build_session_map.py`
 
-Extracts `trace_id` → `Session-Id` mappings from request header logs (where `msg` contains the HTTP headers).
+Extracts trace ID → session ID mappings from request header logs (where `msg` contains the HTTP headers).
 
 ```bash
 python build_session_map.py <header_log.jsonl> -o session_map.json
 ```
-
-## Log format
-
-Each JSONL line should contain:
-- `trace_id` — unique request identifier
-- `request_body` (string, JSON-encoded) or `body` (object) — with a `messages` array in OpenAI chat format
-- `__TIMESTAMP__` or `ts` — for chronological ordering
