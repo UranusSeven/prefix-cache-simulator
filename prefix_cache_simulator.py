@@ -603,11 +603,12 @@ def main():
     print(f"  Total requests:      {len(result.per_request):,}")
     print(f"  Total prompt tokens: {result.total_prompt_tokens:,}")
     print(f"  Total cached tokens: {result.total_cached_tokens:,}")
-    print(f"  Cache hit rate:      {result.hit_rate:.6f} ({result.hit_rate*100:.2f}%)")
-    reqs_with_hit = sum(1 for r in result.per_request if r.cached_tokens > 0)
-    req_hit_rate = reqs_with_hit / len(result.per_request) if result.per_request else 0.0
-    print(f"  Request hit rate:    {req_hit_rate:.6f} ({req_hit_rate*100:.2f}%) "
-          f"[{reqs_with_hit:,}/{len(result.per_request):,} requests had cache hits]")
+    print(f"  Block hit rate:      {result.hit_rate:.6f} ({result.hit_rate*100:.2f}%)")
+    if result.per_request:
+        req_hit_rate = sum(r.hit_rate for r in result.per_request) / len(result.per_request)
+    else:
+        req_hit_rate = 0.0
+    print(f"  Request hit rate:    {req_hit_rate:.6f} ({req_hit_rate*100:.2f}%)")
     print(f"  Block size:          {args.block_size} tokens")
     print(f"  Cache capacity:      {result.cache_capacity_blocks:,} blocks")
 
