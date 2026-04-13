@@ -195,43 +195,6 @@ def load_tokenizer(path: str):
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
 
-def tokenize_requests(
-    tokenizer, requests: list[ParsedRequest]
-) -> list[list[int]]:
-    """Tokenize all requests using chat template. Returns list of token-id lists."""
-    t0 = time.time()
-    token_lists = []
-    fallback_count = 0
-    for i, req in enumerate(requests):
-        try:
-            ids = tokenizer.apply_chat_template(
-                req.messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=False,
-            )
-        except Exception:
-            # Fallback: encode the flattened prompt if chat template fails
-            ids = tokenizer.encode(req.prompt, add_special_tokens=False)
-            fallback_count += 1
-        token_lists.append(ids)
-        if (i + 1) % 200 == 0:
-            elapsed = time.time() - t0
-            print(
-                f"\r  tokenizing: {i + 1}/{len(requests)} "
-                f"({(i + 1) / max(elapsed, 1e-9):.0f} req/s)",
-                end="", flush=True,
-            )
-    elapsed = time.time() - t0
-    total_tokens = sum(len(t) for t in token_lists)
-    fallback_msg = f", {fallback_count} fallback" if fallback_count else ""
-    print(
-        f"\r  tokenized {len(token_lists)} requests, "
-        f"{total_tokens:,} total tokens in {elapsed:.1f}s{fallback_msg}"
-    )
-    return token_lists
-
-
 # ---------------------------------------------------------------------------
 # Chained-hash block key generation (aligned with vLLM)
 # ---------------------------------------------------------------------------
@@ -365,11 +328,19 @@ class SimulationResult:
 
 
 def run_simulation(
+    tokenizer,
     requests: list[ParsedRequest],
-    token_lists: list[list[int]],
     block_size: int,
     cache_capacity_tokens: int,
+    keep_prompts: bool = False,
 ) -> SimulationResult:
+    """
+    Tokenize and simulate in a single streaming pass.
+
+    Each request is tokenized, simulated, then its messages/prompt are freed
+    to keep peak memory low.  If *keep_prompts* is True the ``prompt`` field
+    is preserved for session analysis.
+    """
     cache_capacity_blocks = cache_capacity_tokens // block_size
     cache = LRUPrefixCache(cache_capacity_blocks)
 
@@ -381,14 +352,35 @@ def run_simulation(
     )
 
     t0 = time.time()
-    for i, (req, tokens) in enumerate(zip(requests, token_lists)):
+    total_tokens = 0
+    fallback_count = 0
+    for i, req in enumerate(requests):
+        # --- tokenize one request ---
+        try:
+            tokens = tokenizer.apply_chat_template(
+                req.messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=False,
+            )
+        except Exception:
+            tokens = tokenizer.encode(req.prompt, add_special_tokens=False)
+            fallback_count += 1
+
+        total_tokens += len(tokens)
+
+        # Free heavy fields immediately; keep prompt only if needed later
+        req.messages = None  # type: ignore[assignment]
+        if not keep_prompts:
+            req.prompt = None  # type: ignore[assignment]
+
         if not tokens:
             continue
 
+        # --- simulate ---
         block_keys = compute_block_keys(tokens, block_size)
         cached_tokens = cache.query(block_keys, block_size)
 
-        # Clamp: last block may be partial, so cached_tokens <= len(tokens)
         prompt_tokens = len(tokens)
         cached_tokens = min(cached_tokens, prompt_tokens)
 
@@ -405,7 +397,7 @@ def run_simulation(
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
             print(
-                f"\r  simulating: {i + 1}/{len(requests)} "
+                f"\r  processing: {i + 1}/{len(requests)} "
                 f"hit_rate={result.hit_rate:.4f} "
                 f"cache_blocks={len(cache.cache):,} "
                 f"({(i + 1) / max(elapsed, 1e-9):.0f} req/s)",
@@ -413,8 +405,10 @@ def run_simulation(
             )
 
     elapsed = time.time() - t0
+    fallback_msg = f", {fallback_count} fallback" if fallback_count else ""
     print(
-        f"\r  simulation done: {len(result.per_request)} requests in {elapsed:.1f}s"
+        f"\r  done: {len(result.per_request)} requests, "
+        f"{total_tokens:,} tokens in {elapsed:.1f}s{fallback_msg}"
     )
     return result
 
@@ -577,27 +571,29 @@ def main():
     args = parser.parse_args()
 
     # 1. Parse log
-    print(f"[1/4] Parsing log file: {args.log_file}")
+    print(f"[1/3] Parsing log file: {args.log_file}")
     requests = parse_log_file(args.log_file)
     if not requests:
         print("No valid requests found. Exiting.")
         sys.exit(1)
 
-    # 2. Tokenize
-    print(f"\n[2/4] Loading tokenizer: {args.tokenizer}")
+    # 2. Load tokenizer
+    print(f"\n[2/3] Loading tokenizer: {args.tokenizer}")
     tokenizer = load_tokenizer(args.tokenizer)
-    print(f"  Tokenizing {len(requests)} requests...")
-    token_lists = tokenize_requests(tokenizer, requests)
 
-    # 3. Simulate
+    # 3. Tokenize + simulate in one streaming pass (avoids holding all token
+    #    lists in memory at once).
+    keep_prompts = bool(args.session_map)
     print(
-        f"\n[3/4] Running simulation "
-        f"(block_size={args.block_size}, "
+        f"\n[3/3] Tokenizing & simulating "
+        f"({len(requests)} requests, "
+        f"block_size={args.block_size}, "
         f"cache_capacity={args.cache_capacity:,} tokens / "
         f"{args.cache_capacity // args.block_size:,} blocks)"
     )
     result = run_simulation(
-        requests, token_lists, args.block_size, args.cache_capacity
+        tokenizer, requests, args.block_size, args.cache_capacity,
+        keep_prompts=keep_prompts,
     )
 
     # Print results
@@ -608,6 +604,10 @@ def main():
     print(f"  Total prompt tokens: {result.total_prompt_tokens:,}")
     print(f"  Total cached tokens: {result.total_cached_tokens:,}")
     print(f"  Cache hit rate:      {result.hit_rate:.6f} ({result.hit_rate*100:.2f}%)")
+    reqs_with_hit = sum(1 for r in result.per_request if r.cached_tokens > 0)
+    req_hit_rate = reqs_with_hit / len(result.per_request) if result.per_request else 0.0
+    print(f"  Request hit rate:    {req_hit_rate:.6f} ({req_hit_rate*100:.2f}%) "
+          f"[{reqs_with_hit:,}/{len(result.per_request):,} requests had cache hits]")
     print(f"  Block size:          {args.block_size} tokens")
     print(f"  Cache capacity:      {result.cache_capacity_blocks:,} blocks")
 
@@ -623,14 +623,14 @@ def main():
         print(f"    max:    {hrs[-1]:.4f}")
         print(f"    mean:   {sum(hrs)/len(hrs):.4f}")
 
-    # 4. Session analysis
+    # Session analysis (optional)
     if args.session_map:
-        print(f"\n[4/4] Session analysis (map: {args.session_map})")
+        print(f"\nSession analysis (map: {args.session_map})")
         with open(args.session_map, "r") as f:
             session_map = json.load(f)
         analyze_sessions(result, session_map, requests, args.top_k_sessions)
     else:
-        print("\n[4/4] Session analysis skipped (no --session-map provided)")
+        print("\nSession analysis skipped (no --session-map provided)")
 
 
 if __name__ == "__main__":
