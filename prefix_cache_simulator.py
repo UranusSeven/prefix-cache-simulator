@@ -557,8 +557,8 @@ def main():
         help="Tokens per cache block (default: 16)",
     )
     parser.add_argument(
-        "--cache-capacity", type=int, default=200_000_000,
-        help="LRU cache capacity in tokens (default: 200,000,000)",
+        "--cache-capacity", type=int, default=3_200_000_000,
+        help="LRU cache capacity in tokens (default: 3,200,000,000)",
     )
     parser.add_argument(
         "--session-map",
