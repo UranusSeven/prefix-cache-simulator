@@ -748,7 +748,12 @@ def _print_group_results(sorted_groups: list[tuple[str, SimulationResult]]):
         ])
         group_sizes = sorted(len(gr.per_request) for _, gr in sorted_groups)
 
+        avg_block_hr = sum(block_hit_rates) / num_groups
+        avg_req_hr = sum(req_hit_rates) / num_groups
+
         print(f"  Total groups: {num_groups}")
+        print(f"  Avg block hit rate:   {avg_block_hr:.4f}")
+        print(f"  Avg request hit rate: {avg_req_hr:.4f}")
         print(f"\n  {'Percentile':>10}  {'Block HR':>10}  {'Request HR':>10}  {'Group Size':>10}")
         print(f"  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
         for p in [10, 20, 30, 40, 50, 60, 70, 80, 90, 99]:
