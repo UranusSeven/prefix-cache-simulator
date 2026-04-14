@@ -29,6 +29,7 @@ class ParsedRequest:
     messages: list       # raw messages list (OpenAI chat format)
     prompt: str          # flattened text for fuzzy matching in session analysis
     model: str = ""
+    group: str = ""
 
 
 def _decode_unicode_escapes(raw: str) -> str:
@@ -123,7 +124,7 @@ def _extract_messages_from_body(body: dict) -> Optional[tuple[list, str]]:
     return clean_messages, "\n".join(text_parts)
 
 
-def parse_log_file(path: str) -> list[ParsedRequest]:
+def parse_log_file(path: str, group_key: str | None = None) -> list[ParsedRequest]:
     """Parse a JSONL log file into a list of ParsedRequests, sorted by timestamp."""
     requests = []
     skipped_multimodal = 0
@@ -157,12 +158,15 @@ def parse_log_file(path: str) -> list[ParsedRequest]:
             timestamp = entry.get("__TIMESTAMP__", entry.get("ts", ""))
             model = entry.get("model_name", body.get("model", ""))
 
+            group = str(entry.get(group_key, "")) if group_key else ""
+
             requests.append(ParsedRequest(
                 trace_id=trace_id,
                 timestamp=str(timestamp),
                 messages=messages,
                 prompt=prompt_text,
                 model=model,
+                group=group,
             ))
 
             if lineno % 500 == 0:
@@ -304,10 +308,38 @@ class RequestResult:
     trace_id: str
     prompt_tokens: int
     cached_tokens: int
+    group: str = ""
+    group_cached_tokens: int = 0
 
     @property
     def hit_rate(self) -> float:
         return self.cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+    @property
+    def group_hit_rate(self) -> float:
+        return self.group_cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+
+@dataclass
+class GroupResult:
+    group: str
+    total_prompt_tokens: int = 0
+    total_cached_tokens: int = 0
+    per_request: list[RequestResult] = field(default_factory=list)
+
+    @property
+    def hit_rate(self) -> float:
+        return (
+            self.total_cached_tokens / self.total_prompt_tokens
+            if self.total_prompt_tokens
+            else 0.0
+        )
+
+    @property
+    def request_hit_rate(self) -> float:
+        if not self.per_request:
+            return 0.0
+        return sum(r.group_hit_rate for r in self.per_request) / len(self.per_request)
 
 
 @dataclass
@@ -317,6 +349,7 @@ class SimulationResult:
     total_prompt_tokens: int
     total_cached_tokens: int
     per_request: list[RequestResult] = field(default_factory=list)
+    grouped: dict[str, GroupResult] = field(default_factory=dict)
 
     @property
     def hit_rate(self) -> float:
@@ -333,6 +366,7 @@ def run_simulation(
     block_size: int,
     cache_capacity_tokens: int,
     keep_prompts: bool = False,
+    group_key: str | None = None,
 ) -> SimulationResult:
     """
     Tokenize and simulate in a single streaming pass.
@@ -340,9 +374,15 @@ def run_simulation(
     Each request is tokenized, simulated, then its messages/prompt are freed
     to keep peak memory low.  If *keep_prompts* is True the ``prompt`` field
     is preserved for session analysis.
+
+    When *group_key* is set, each unique group value gets its own LRU cache
+    and per-group statistics are tracked alongside the global cache.
     """
     cache_capacity_blocks = cache_capacity_tokens // block_size
     cache = LRUPrefixCache(cache_capacity_blocks)
+
+    # Per-group caches (created on demand)
+    group_caches: dict[str, LRUPrefixCache] = {}
 
     result = SimulationResult(
         block_size=block_size,
@@ -384,15 +424,36 @@ def run_simulation(
         prompt_tokens = len(tokens)
         cached_tokens = min(cached_tokens, prompt_tokens)
 
+        # Per-group simulation
+        group_cached_tokens = 0
+        if group_key:
+            group_val = req.group
+            if group_val not in group_caches:
+                group_caches[group_val] = LRUPrefixCache(cache_capacity_blocks)
+            group_cached_tokens = group_caches[group_val].query(block_keys, block_size)
+            group_cached_tokens = min(group_cached_tokens, prompt_tokens)
+
         result.total_prompt_tokens += prompt_tokens
         result.total_cached_tokens += cached_tokens
-        result.per_request.append(
-            RequestResult(
-                trace_id=req.trace_id,
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens,
-            )
+
+        rr = RequestResult(
+            trace_id=req.trace_id,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            group=req.group,
+            group_cached_tokens=group_cached_tokens,
         )
+        result.per_request.append(rr)
+
+        # Accumulate per-group stats
+        if group_key:
+            group_val = req.group
+            if group_val not in result.grouped:
+                result.grouped[group_val] = GroupResult(group=group_val)
+            gr = result.grouped[group_val]
+            gr.total_prompt_tokens += prompt_tokens
+            gr.total_cached_tokens += group_cached_tokens
+            gr.per_request.append(rr)
 
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
@@ -561,6 +622,10 @@ def main():
         help="LRU cache capacity in tokens (default: 3,200,000,000)",
     )
     parser.add_argument(
+        "--group-key",
+        help="Root-level JSONL field to group by (each group gets its own LRU cache)",
+    )
+    parser.add_argument(
         "--session-map",
         help="JSON file mapping trace_id -> session_id",
     )
@@ -572,7 +637,7 @@ def main():
 
     # 1. Parse log
     print(f"[1/3] Parsing log file: {args.log_file}")
-    requests = parse_log_file(args.log_file)
+    requests = parse_log_file(args.log_file, group_key=args.group_key)
     if not requests:
         print("No valid requests found. Exiting.")
         sys.exit(1)
@@ -594,6 +659,7 @@ def main():
     result = run_simulation(
         tokenizer, requests, args.block_size, args.cache_capacity,
         keep_prompts=keep_prompts,
+        group_key=args.group_key,
     )
 
     # Print results
@@ -623,6 +689,23 @@ def main():
         print(f"    p75:    {hrs[3*len(hrs)//4]:.4f}")
         print(f"    max:    {hrs[-1]:.4f}")
         print(f"    mean:   {sum(hrs)/len(hrs):.4f}")
+
+    # Grouped results (optional)
+    if args.group_key and result.grouped:
+        print(f"\n{'='*70}")
+        print(f"GROUPED RESULTS (by {args.group_key})")
+        print(f"{'='*70}")
+        print(f"  Groups: {len(result.grouped)}")
+        print(f"\n  {'Group':<40} {'Reqs':>6} {'Tokens':>12} {'Cached':>12} {'BlkHitRate':>10} {'ReqHitRate':>10}")
+        print(f"  {'-'*40} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+        for group_val in sorted(result.grouped):
+            gr = result.grouped[group_val]
+            display_group = group_val if group_val else "(empty)"
+            print(
+                f"  {display_group:<40} {len(gr.per_request):>6} "
+                f"{gr.total_prompt_tokens:>12,} {gr.total_cached_tokens:>12,} "
+                f"{gr.hit_rate:>10.4f} {gr.request_hit_rate:>10.4f}"
+            )
 
     # Session analysis (optional)
     if args.session_map:
