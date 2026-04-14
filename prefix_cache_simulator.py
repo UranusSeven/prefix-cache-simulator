@@ -696,13 +696,24 @@ def main():
         print(f"GROUPED RESULTS (by {args.group_key})")
         print(f"{'='*70}")
         print(f"  Groups: {len(result.grouped)}")
-        print(f"\n  {'Group':<40} {'Reqs':>6} {'Tokens':>12} {'Cached':>12} {'BlkHitRate':>10} {'ReqHitRate':>10}")
-        print(f"  {'-'*40} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
-        for group_val in sorted(result.grouped):
+
+        # Build display names and compute dynamic column width
+        sorted_groups = sorted(result.grouped)
+        display_names = {
+            g: (g if g else "(empty)") for g in sorted_groups
+        }
+        max_name = max(len(v) for v in display_names.values())
+        gw = min(max(max_name, 5), 60)  # clamp between 5 and 60
+
+        print(f"\n  {'Group':<{gw}} {'Reqs':>6} {'Tokens':>12} {'Cached':>12} {'BlkHitRate':>10} {'ReqHitRate':>10}")
+        print(f"  {'-'*gw} {'-'*6} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+        for group_val in sorted_groups:
             gr = result.grouped[group_val]
-            display_group = group_val if group_val else "(empty)"
+            name = display_names[group_val]
+            if len(name) > gw:
+                name = name[: gw - 3] + "..."
             print(
-                f"  {display_group:<40} {len(gr.per_request):>6} "
+                f"  {name:<{gw}} {len(gr.per_request):>6} "
                 f"{gr.total_prompt_tokens:>12,} {gr.total_cached_tokens:>12,} "
                 f"{gr.hit_rate:>10.4f} {gr.request_hit_rate:>10.4f}"
             )
