@@ -66,7 +66,7 @@ python weka_adapter.py traces.jsonl -o requests_b1536.jsonl --superblock-tokens 
 # Kimi-K3-style hybrid run: checkpoint per block (vLLM align mode)
 python prefix_cache_simulator.py requests_b1536.jsonl \
   --block-size 1536 --cache-capacity 500000000 \
-  --mamba-state-interval 1536 --mamba-state-size 11300
+  --mamba-state-interval 1536 --mamba-state-size 16253
 ```
 
 A superblock is identified by the ordered tuple of its source block ids, so
@@ -121,9 +121,12 @@ Semantics, mirroring vLLM v1's `MambaManager`:
                      / total_kv_bytes_per_token_across_attn_layers
   ```
 
-  e.g. 45 KDA layers × 4.14 MiB state ÷ (15 MLA layers × 1152 B/token)
-  ≈ 11,300 tokens per checkpoint (TP-invariant: state and KV both shrink
-  with TP, so the ratio is unchanged at TP8).
+  e.g. Kimi-K3 (93 layers: 69 KDA + 24 MLA): per KDA layer the state is
+  `(3·96·128)·3·2 B` conv (bf16) + `96·128·128·4 B` recurrent (fp32)
+  = 6.21 MiB, so a checkpoint is 69 × 6.21 MiB ≈ 428.6 MiB; MLA KV is
+  24 × (512+64) × 2 B = 27,648 B/token → ≈ 16,253 tokens per checkpoint
+  (TP-invariant: state and KV both shrink with TP, so the ratio is
+  unchanged at TP8).
 
 Not modeled (second order for hit-rate estimation): the 2+spec resident
 blocks each in-flight request holds, and chunked-prefill boundary alignment.
