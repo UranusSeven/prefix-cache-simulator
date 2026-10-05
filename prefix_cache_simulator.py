@@ -16,12 +16,7 @@ import sys
 import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from math import gcd
 from typing import Optional
-
-
-def cdiv(a: int, b: int) -> int:
-    return -(a // -b)
 
 
 # ---------------------------------------------------------------------------
@@ -262,285 +257,137 @@ def compute_block_keys(token_ids: list[int], block_size: int) -> list[bytes]:
 
 class LRUPrefixCache:
     """
-    LRU cache keyed by chained block hashes.
-    Capacity is measured in number of blocks.
+    LRU cache keyed by chained block hashes, optionally also holding mamba
+    state checkpoint entries.
+
+    Capacity and entry costs are all measured in tokens: a KV block entry
+    costs ``block_size`` tokens, a mamba checkpoint entry costs
+    ``mamba_state_size`` tokens (the caller converts state bytes to
+    token-equivalents — see README).
     """
 
-    def __init__(self, capacity_blocks: int):
-        self.capacity = capacity_blocks
-        self.cache: OrderedDict[bytes, None] = OrderedDict()
+    def __init__(self, capacity_tokens: int, block_size: int):
+        self.capacity = capacity_tokens
+        self.block_size = block_size
+        self.cache: OrderedDict[bytes, tuple[int, bool]] = OrderedDict()
+        # key -> (cost in tokens, is_checkpoint)
+        self.usage = 0
+        self.num_blocks = 0
+        self.num_checkpoints = 0
+
+    def _store(self, key: bytes, cost: int, is_checkpoint: bool = False) -> None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return
+        if cost > self.capacity:
+            return  # single entry larger than the pool: never cached
+        self.cache[key] = (cost, is_checkpoint)
+        self.usage += cost
+        if is_checkpoint:
+            self.num_checkpoints += 1
+        else:
+            self.num_blocks += 1
+        while self.usage > self.capacity:
+            _, (evicted_cost, evicted_is_cp) = self.cache.popitem(last=False)
+            self.usage -= evicted_cost
+            if evicted_is_cp:
+                self.num_checkpoints -= 1
+            else:
+                self.num_blocks -= 1
 
     def query(
         self,
-        block_keys: list[int],
-        block_size: int,
+        block_keys: list[bytes],
         drop_tail: bool = False,
+        checkpoint_keys: Optional[list[tuple[int, bytes]]] = None,
+        checkpoint_cost: int = 0,
     ) -> int:
         """
         Simulate a prefix-cache lookup for one request.
 
         Returns the number of cached (hit) tokens.
-        After the lookup, ALL blocks are written/updated in the cache.
+        After the lookup, ALL entries are written/updated in the cache.
 
         With ``drop_tail=True`` the final key (partial tail block) is
         neither read nor written, modeling engines that only cache full
-        blocks. vLLM's mamba align mode also caches the prompt's partial
-        tail, so the default keeps it.
+        blocks.
+
+        ``checkpoint_keys`` is a list of (token_position, key) pairs for
+        mamba state checkpoints. When given, the hit is gated on state
+        availability: the reusable prefix is the newest cached checkpoint
+        position covered by the KV prefix match (a hybrid model cannot
+        resume mid-sequence without a state checkpoint).
         """
         if drop_tail and block_keys:
             block_keys = block_keys[:-1]
 
-        cached_tokens = 0
-
-        # Phase 1: prefix match — sequential check, stop at first miss
-        for i, key in enumerate(block_keys):
+        # Phase 1: KV prefix match — sequential check, stop at first miss
+        kv_hit = 0
+        for key in block_keys:
             if key in self.cache:
                 # Hit — count tokens in this block
                 # Last block may be shorter, but we count block_size for
                 # uniformity (the caller tracks actual token counts).
-                cached_tokens += block_size
+                kv_hit += self.block_size
                 # Touch: move to end (most recently used)
                 self.cache.move_to_end(key)
             else:
                 break  # first miss stops prefix matching
 
-        # Phase 2: write all blocks into cache
+        # Phase 2: gate on the newest cached mamba checkpoint within the
+        # KV-matched prefix (scan right to left, like vLLM's MambaManager).
+        if checkpoint_keys is not None:
+            hit = 0
+            for pos, key in reversed(checkpoint_keys):
+                if pos <= kv_hit and key in self.cache:
+                    hit = pos
+                    self.cache.move_to_end(key)
+                    break
+        else:
+            hit = kv_hit
+
+        # Phase 3: write all entries into cache
         for key in block_keys:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            else:
-                self.cache[key] = None
-                if len(self.cache) > self.capacity:
-                    self.cache.popitem(last=False)  # evict LRU
+            self._store(key, self.block_size)
+        if checkpoint_keys is not None:
+            for _, key in checkpoint_keys:
+                self._store(key, checkpoint_cost, is_checkpoint=True)
 
-        return cached_tokens
+        return hit
 
 
 # ---------------------------------------------------------------------------
-# Hybrid (attention + mamba) memory model
+# Mamba state checkpoints
 #
-# Mirrors vLLM v1's hybrid KV-cache sizing for models like Kimi-K3 / Kimi
-# Linear (KDA linear attention + MLA full attention):
-#
-#   * Every cached block id holds, per mamba layer, a *state checkpoint*
-#     (conv state + fp32 recurrent state) taken at that block's end boundary,
-#     and per attention layer the paged KV for that block's tokens.
-#     (mamba_cache_mode="align": state is cached only at block boundaries,
-#     plus the prompt's partial tail block.)
-#   * vLLM unifies page sizes across layer types: if the mamba state page is
-#     larger than one attention page, the attention block size is raised
-#     (align mode sets mamba_block_size = block_size), then the mamba page is
-#     padded up to the attention page.  See
-#     vllm/platforms/interface.py::_align_hybrid_block_size.
-#   * Layers are merged into equal-size KV-cache groups, so the pool cost of
-#     one block is (num_attn_layers + num_mamba_layers) * unified_page_bytes.
-#
-# The hit *rule* is unchanged (chained-hash prefix match over the unified
-# pool); what changes is the per-block memory cost, and therefore how many
-# blocks fit in a given byte budget.
+# Hybrid linear-attention models (Kimi-K3 / Kimi-Linear: KDA + MLA) can only
+# reuse a cached prefix if a mamba/linear state checkpoint exists at the
+# resume position. vLLM's mamba_cache_mode="align" stores one checkpoint per
+# block boundary (plus the prompt's partial tail); this simulator makes the
+# granularity explicit via --mamba-state-interval and charges each checkpoint
+# --mamba-state-size tokens of pool capacity.
 # ---------------------------------------------------------------------------
 
-_DTYPE_BYTES = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1, "int8": 1}
-
-
-def parse_byte_size(s: str) -> int:
-    """Parse a byte size like '80GiB', '512MiB', '1e9', '1000000'."""
-    s = s.strip()
-    units = {
-        "gib": 1 << 30, "mib": 1 << 20, "kib": 1 << 10,
-        "gb": 10**9, "mb": 10**6, "kb": 10**3, "b": 1,
-    }
-    lower = s.lower()
-    for suffix in ("gib", "mib", "kib", "gb", "mb", "kb", "b"):
-        if lower.endswith(suffix):
-            return int(float(s[: -len(suffix)]) * units[suffix])
-    return int(float(s))
-
-
-def kda_state_bytes(
-    num_heads: int,
-    head_dim: int,
-    conv_kernel_size: int = 4,
-    num_spec: int = 0,
-    conv_dtype_bytes: int = 2,
-    num_k_heads: Optional[int] = None,
-    head_k_dim: Optional[int] = None,
-    tp_size: int = 1,
-) -> int:
+def compute_checkpoint_keys(
+    token_ids: list[int], interval: int
+) -> list[tuple[int, bytes]]:
     """
-    Bytes of KDA (Kimi Delta Attention) state per layer per block.
+    Split token_ids into intervals of `interval` tokens and produce a
+    chained-hash checkpoint key for each interval boundary. The final
+    partial interval counts as a checkpoint (position == len(token_ids)).
 
-    Follows MambaStateShapeCalculator.kda_state_shape
-    (vllm/model_executor/layers/mamba/mamba_utils.py):
-      conv_state      = (num_heads*head_dim + 2*num_k_heads*head_k_dim)
-                        x (conv_kernel_size - 1 + num_spec), conv dtype
-      recurrent_state = num_heads x head_dim x head_dim, always fp32
+    Checkpoint keys live in their own hash namespace (extra_keys marker) so
+    they stay distinct cache entries even when interval == block_size.
+
+    Returns a list of (token_position, key) pairs, ascending by position.
     """
-    if num_k_heads is None:
-        num_k_heads = num_heads
-    if head_k_dim is None:
-        head_k_dim = head_dim
-    conv_dim = num_heads * head_dim + 2 * num_k_heads * head_k_dim
-    conv_elems = cdiv(conv_dim, tp_size) * (conv_kernel_size - 1 + num_spec)
-    recurrent_elems = cdiv(num_heads, tp_size) * head_dim * head_dim
-    return conv_elems * conv_dtype_bytes + recurrent_elems * 4
-
-
-def mla_attn_bytes_per_token(
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    dtype_bytes: int = 2,
-    tp_size: int = 1,
-) -> int:
-    """MLA stores one compressed latent (kv_lora_rank + qk_rope_head_dim)
-    per token with a single KV head."""
-    return cdiv(1, tp_size) * (kv_lora_rank + qk_rope_head_dim) * dtype_bytes
-
-
-def full_attn_bytes_per_token(
-    num_kv_heads: int,
-    head_dim: int,
-    dtype_bytes: int = 2,
-    tp_size: int = 1,
-) -> int:
-    """Standard GQA/MHA: K and V per token."""
-    return 2 * cdiv(num_kv_heads, tp_size) * head_dim * dtype_bytes
-
-
-@dataclass
-class HybridMemoryModel:
-    """Per-block memory cost of a hybrid attention+mamba prefix cache."""
-
-    block_size: int            # effective tokens/block (possibly raised)
-    attn_page_bytes: int       # per attention layer per block
-    mamba_page_bytes: int      # per mamba layer per block (raw state size)
-    unified_page_bytes: int    # max(attn_page, mamba_page); mamba is padded to this
-    num_attn_layers: int
-    num_mamba_layers: int
-    mamba_padding_pct: float
-
-    @property
-    def per_block_bytes(self) -> int:
-        # Equal-size groups: each layer costs one unified page per block.
-        return (self.num_attn_layers + self.num_mamba_layers) * self.unified_page_bytes
-
-    def summary(self) -> str:
-        lines = [
-            f"  attn layers x page:      {self.num_attn_layers} x "
-            f"{self.attn_page_bytes:,} B",
-            f"  mamba layers x page:     {self.num_mamba_layers} x "
-            f"{self.mamba_page_bytes:,} B (state)",
-            f"  unified page:            {self.unified_page_bytes:,} B "
-            f"(mamba padded +{self.mamba_padding_pct:.1f}%)",
-            f"  effective block size:    {self.block_size} tokens",
-            f"  per-block cost:          {self.per_block_bytes:,} B "
-            f"({self.per_block_bytes / (1 << 20):.2f} MiB)",
-        ]
-        return "\n".join(lines)
-
-
-def build_hybrid_memory_model(
-    num_attn_layers: int,
-    num_mamba_layers: int,
-    attn_bytes_per_token: int,
-    mamba_state_bytes: int,
-    block_size: int,
-    kernel_block_alignment: int = 16,
-) -> HybridMemoryModel:
-    """
-    Reproduce vLLM's page unification (align mode).
-
-    If one mamba state page does not fit in one attention page, the attention
-    block size is raised to the smallest multiple of kernel_block_alignment
-    whose page covers the mamba state.  The mamba page is then padded up to
-    the attention page.
-    """
-    attn_page = block_size * attn_bytes_per_token
-    if attn_page < mamba_state_bytes:
-        block_size = kernel_block_alignment * cdiv(
-            mamba_state_bytes, kernel_block_alignment * attn_bytes_per_token
-        )
-        attn_page = block_size * attn_bytes_per_token
-    unified = max(attn_page, mamba_state_bytes)
-    padding_pct = (
-        100.0 * (unified - mamba_state_bytes) / mamba_state_bytes
-        if mamba_state_bytes
-        else 0.0
-    )
-    return HybridMemoryModel(
-        block_size=block_size,
-        attn_page_bytes=attn_page,
-        mamba_page_bytes=mamba_state_bytes,
-        unified_page_bytes=unified,
-        num_attn_layers=num_attn_layers,
-        num_mamba_layers=num_mamba_layers,
-        mamba_padding_pct=padding_pct,
-    )
-
-
-def hybrid_model_from_hf_config(
-    config: dict,
-    block_size: int,
-    dtype: str = "bf16",
-    num_spec: int = 0,
-    tp_size: int = 1,
-    kernel_block_alignment: int = 16,
-) -> HybridMemoryModel:
-    """
-    Derive the hybrid memory model from a HuggingFace config.json of a
-    Kimi-Linear-style model (`linear_attn_config` with kda_layers).
-    """
-    dtype_bytes = _DTYPE_BYTES[dtype]
-    lac = config.get("linear_attn_config")
-    if not isinstance(lac, dict):
-        raise ValueError(
-            "config has no 'linear_attn_config'; not a KDA hybrid model. "
-            "Use explicit --num-*-layers/--mamba-state-bytes flags instead."
-        )
-    kda_layers = lac.get("kda_layers") or []
-    num_layers = config.get("num_hidden_layers")
-    if not num_layers:
-        raise ValueError("config missing 'num_hidden_layers'")
-    num_mamba_layers = len(kda_layers)
-    num_attn_layers = num_layers - num_mamba_layers
-
-    mamba_bytes = kda_state_bytes(
-        num_heads=lac["num_heads"],
-        head_dim=lac["head_dim"],
-        conv_kernel_size=lac.get("short_conv_kernel_size", 4),
-        num_spec=num_spec,
-        conv_dtype_bytes=dtype_bytes,
-        num_k_heads=lac.get("num_k_heads"),
-        head_k_dim=lac.get("head_k_dim"),
-        tp_size=tp_size,
-    )
-
-    if "kv_lora_rank" in config:
-        attn_per_token = mla_attn_bytes_per_token(
-            config["kv_lora_rank"],
-            config.get("qk_rope_head_dim", 64),
-            dtype_bytes=dtype_bytes,
-            tp_size=tp_size,
-        )
-    else:
-        head_dim = config.get(
-            "head_dim", config["hidden_size"] // config["num_attention_heads"]
-        )
-        attn_per_token = full_attn_bytes_per_token(
-            config.get("num_key_value_heads", config["num_attention_heads"]),
-            head_dim,
-            dtype_bytes=dtype_bytes,
-            tp_size=tp_size,
-        )
-
-    return build_hybrid_memory_model(
-        num_attn_layers=num_attn_layers,
-        num_mamba_layers=num_mamba_layers,
-        attn_bytes_per_token=attn_per_token,
-        mamba_state_bytes=mamba_bytes,
-        block_size=block_size,
-        kernel_block_alignment=kernel_block_alignment,
-    )
+    keys: list[tuple[int, bytes]] = []
+    prev_hash = _NONE_HASH
+    for start in range(0, len(token_ids), interval):
+        chunk = tuple(token_ids[start : start + interval])
+        prev_hash = _hash_block_tokens(prev_hash, chunk,
+                                       extra_keys=("mamba-checkpoint",))
+        keys.append((min(start + interval, len(token_ids)), prev_hash))
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +436,14 @@ class GroupResult:
 @dataclass
 class SimulationResult:
     block_size: int
-    cache_capacity_blocks: int
+    cache_capacity_tokens: int
     total_prompt_tokens: int
     total_cached_tokens: int
+    mamba_state_interval: int | None = None
+    mamba_state_size: int = 0
+    cache_usage_tokens: int = 0
+    cache_blocks: int = 0
+    cache_checkpoints: int = 0
     per_request: list[RequestResult] = field(default_factory=list)
     grouped: dict[str, GroupResult] = field(default_factory=dict)
 
@@ -612,8 +464,9 @@ def run_simulation(
     keep_prompts: bool = False,
     group_key: str | None = None,
     max_requests: int | None = None,
-    cache_capacity_blocks: int | None = None,
     cache_partial_tail: bool = True,
+    mamba_state_interval: int | None = None,
+    mamba_state_size: int = 0,
 ) -> SimulationResult:
     """
     Tokenize and simulate in a single streaming pass.
@@ -625,23 +478,27 @@ def run_simulation(
     When *group_key* is set, each unique group value gets its own LRU cache
     and per-group statistics are tracked alongside the global cache.
 
-    *cache_capacity_blocks*, when given, overrides the token-derived block
-    capacity (used by the hybrid memory model, where the pool is sized in
-    bytes). *cache_partial_tail=False* models engines that never cache the
-    final partial block.
+    *cache_partial_tail=False* models engines that never cache the final
+    partial block.
+
+    When *mamba_state_interval* is set, the simulation also stores a mamba
+    state checkpoint every *mamba_state_interval* tokens (the final partial
+    interval counts as a checkpoint), each charging *mamba_state_size*
+    tokens of pool capacity, and a request's reusable prefix is gated on
+    the newest cached checkpoint covered by its KV prefix match.
     """
-    if cache_capacity_blocks is None:
-        cache_capacity_blocks = cache_capacity_tokens // block_size
-    cache = LRUPrefixCache(cache_capacity_blocks)
+    cache = LRUPrefixCache(cache_capacity_tokens, block_size)
 
     # Per-group caches (created on demand)
     group_caches: dict[str, LRUPrefixCache] = {}
 
     result = SimulationResult(
         block_size=block_size,
-        cache_capacity_blocks=cache_capacity_blocks,
+        cache_capacity_tokens=cache_capacity_tokens,
         total_prompt_tokens=0,
         total_cached_tokens=0,
+        mamba_state_interval=mamba_state_interval,
+        mamba_state_size=mamba_state_size,
     )
 
     # Support early stop via Ctrl-C
@@ -689,7 +546,17 @@ def run_simulation(
         # --- simulate ---
         block_keys = compute_block_keys(tokens, block_size)
         drop_tail = not cache_partial_tail and len(tokens) % block_size != 0
-        cached_tokens = cache.query(block_keys, block_size, drop_tail=drop_tail)
+        checkpoint_keys = (
+            compute_checkpoint_keys(tokens, mamba_state_interval)
+            if mamba_state_interval
+            else None
+        )
+        cached_tokens = cache.query(
+            block_keys,
+            drop_tail=drop_tail,
+            checkpoint_keys=checkpoint_keys,
+            checkpoint_cost=mamba_state_size,
+        )
 
         prompt_tokens = len(tokens)
         cached_tokens = min(cached_tokens, prompt_tokens)
@@ -699,9 +566,14 @@ def run_simulation(
         if group_key:
             group_val = req.group
             if group_val not in group_caches:
-                group_caches[group_val] = LRUPrefixCache(cache_capacity_blocks)
+                group_caches[group_val] = LRUPrefixCache(
+                    cache_capacity_tokens, block_size
+                )
             group_cached_tokens = group_caches[group_val].query(
-                block_keys, block_size, drop_tail=drop_tail
+                block_keys,
+                drop_tail=drop_tail,
+                checkpoint_keys=checkpoint_keys,
+                checkpoint_cost=mamba_state_size,
             )
             group_cached_tokens = min(group_cached_tokens, prompt_tokens)
 
@@ -738,6 +610,10 @@ def run_simulation(
             )
 
     signal.signal(signal.SIGINT, original_handler)
+
+    result.cache_usage_tokens = cache.usage
+    result.cache_blocks = cache.num_blocks
+    result.cache_checkpoints = cache.num_checkpoints
 
     elapsed = time.time() - t0
     fallback_msg = f", {fallback_count} fallback" if fallback_count else ""
@@ -912,136 +788,43 @@ def main():
         help="Number of low-hit sessions to analyze (default: 5)",
     )
 
-    # --- Hybrid (attention + mamba state) prefix-cache memory model ---
-    hybrid = parser.add_argument_group(
-        "hybrid mamba model",
-        "Size the cache in bytes with vLLM's hybrid attention+mamba page "
-        "accounting (Kimi-K3 / Kimi-Linear style). Enabled by "
-        "--cache-capacity-bytes plus either --model-config or the explicit "
-        "layer/state flags.",
+    # --- Mamba state checkpoint model (hybrid linear-attention models) ---
+    mamba = parser.add_argument_group(
+        "mamba state checkpoints",
+        "For hybrid linear-attention models (Kimi-K3 / Kimi-Linear: KDA + "
+        "MLA), a cached prefix is only reusable up to a stored mamba state "
+        "checkpoint. Checkpoints are stored every --mamba-state-interval "
+        "tokens (the final partial interval counts) and each charges "
+        "--mamba-state-size tokens of pool capacity.",
     )
-    hybrid.add_argument(
-        "--cache-capacity-bytes",
-        help="LRU pool capacity in bytes (e.g. '80GiB'). Enables hybrid mode.",
+    mamba.add_argument(
+        "--mamba-state-interval", type=int, default=None,
+        help="Store a mamba state checkpoint every N tokens. Set equal to "
+        "--block-size to mirror vLLM's mamba_cache_mode=align.",
     )
-    hybrid.add_argument(
-        "--model-config",
-        help="Path to the model's HF config.json (Kimi-Linear style with "
-        "linear_attn_config); layer counts and state sizes are derived from it.",
+    mamba.add_argument(
+        "--mamba-state-size", type=int, default=None,
+        help="Capacity cost of one checkpoint, in token-equivalents: "
+        "total_state_bytes_across_layers / total_kv_bytes_per_token_"
+        "across_layers. Required with --mamba-state-interval.",
     )
-    hybrid.add_argument(
-        "--dtype", choices=sorted(_DTYPE_BYTES), default="bf16",
-        help="Model/cache dtype for conv state and KV (default: bf16). "
-        "Recurrent state is always fp32, as in vLLM.",
-    )
-    hybrid.add_argument(
-        "--num-speculative-tokens", type=int, default=0,
-        help="Speculative decoding width; widens the conv state window.",
-    )
-    hybrid.add_argument(
-        "--tp-size", type=int, default=1,
-        help="Tensor-parallel size; per-block state/KV shrinks with TP.",
-    )
-    hybrid.add_argument(
-        "--kernel-block-alignment", type=int, default=16,
-        help="Attention kernel block alignment used when raising block_size "
-        "to fit a mamba state page (default: 16).",
-    )
-    hybrid.add_argument("--num-attn-layers", type=int)
-    hybrid.add_argument("--num-mamba-layers", type=int)
-    hybrid.add_argument(
-        "--mamba-state-bytes", type=int,
-        help="Explicit mamba state bytes per layer per block (overrides "
-        "config-derived value).",
-    )
-    hybrid.add_argument(
-        "--attn-bytes-per-token", type=int,
-        help="Explicit attention KV bytes per layer per token (overrides "
-        "config-derived value).",
-    )
-    hybrid.add_argument(
+    parser.add_argument(
         "--no-tail-cache", action="store_true",
         help="Never cache the final partial block (vLLM mamba align mode "
         "does cache the partial tail; this models engines that don't).",
     )
     args = parser.parse_args()
 
-    # Resolve hybrid memory model (if enabled)
-    hybrid_model: HybridMemoryModel | None = None
-    explicit_hybrid = any(
-        v is not None
-        for v in (
-            args.num_attn_layers,
-            args.num_mamba_layers,
-            args.mamba_state_bytes,
-            args.attn_bytes_per_token,
-        )
-    )
-    if args.cache_capacity_bytes or args.model_config or explicit_hybrid:
-        if not args.cache_capacity_bytes:
-            parser.error("hybrid mode requires --cache-capacity-bytes")
-        dtype_bytes = _DTYPE_BYTES[args.dtype]
-        if args.model_config:
-            with open(args.model_config, "r", encoding="utf-8") as f:
-                model_config = json.load(f)
-            hybrid_model = hybrid_model_from_hf_config(
-                model_config,
-                block_size=args.block_size,
-                dtype=args.dtype,
-                num_spec=args.num_speculative_tokens,
-                tp_size=args.tp_size,
-                kernel_block_alignment=args.kernel_block_alignment,
-            )
-        else:
-            missing = [
-                name
-                for name, v in (
-                    ("--num-attn-layers", args.num_attn_layers),
-                    ("--num-mamba-layers", args.num_mamba_layers),
-                    ("--mamba-state-bytes", args.mamba_state_bytes),
-                    ("--attn-bytes-per-token", args.attn_bytes_per_token),
-                )
-                if v is None
-            ]
-            if missing:
-                parser.error(
-                    "hybrid mode without --model-config requires: "
-                    + ", ".join(missing)
-                )
-            hybrid_model = build_hybrid_memory_model(
-                num_attn_layers=args.num_attn_layers,
-                num_mamba_layers=args.num_mamba_layers,
-                attn_bytes_per_token=args.attn_bytes_per_token,
-                mamba_state_bytes=args.mamba_state_bytes,
-                block_size=args.block_size,
-                kernel_block_alignment=args.kernel_block_alignment,
-            )
-        # Explicit flags override config-derived values
-        if args.model_config and explicit_hybrid:
-            hybrid_model = build_hybrid_memory_model(
-                num_attn_layers=args.num_attn_layers
-                or hybrid_model.num_attn_layers,
-                num_mamba_layers=args.num_mamba_layers
-                or hybrid_model.num_mamba_layers,
-                attn_bytes_per_token=args.attn_bytes_per_token
-                or hybrid_model.attn_page_bytes // hybrid_model.block_size,
-                mamba_state_bytes=args.mamba_state_bytes
-                or hybrid_model.mamba_page_bytes,
-                block_size=args.block_size,
-                kernel_block_alignment=args.kernel_block_alignment,
-            )
-        capacity_bytes = parse_byte_size(args.cache_capacity_bytes)
-        cache_capacity_blocks = capacity_bytes // hybrid_model.per_block_bytes
-        if hybrid_model.block_size != args.block_size:
-            print(
-                f"NOTE: block size raised {args.block_size} -> "
-                f"{hybrid_model.block_size} tokens so one attention page can "
-                f"hold one mamba state (vLLM align behavior)."
-            )
-        args.block_size = hybrid_model.block_size
-    else:
-        capacity_bytes = None
-        cache_capacity_blocks = None
+    if args.mamba_state_interval is not None:
+        if args.mamba_state_interval <= 0:
+            parser.error("--mamba-state-interval must be positive")
+        if args.mamba_state_size is None:
+            parser.error("--mamba-state-interval requires --mamba-state-size")
+        if args.mamba_state_size < 0:
+            parser.error("--mamba-state-size must be >= 0")
+    elif args.mamba_state_size is not None:
+        parser.error("--mamba-state-size only makes sense with "
+                     "--mamba-state-interval")
 
     # 1. Parse log
     print(f"[1/3] Parsing log file: {args.log_file}")
@@ -1064,20 +847,19 @@ def main():
         f"cache_capacity={args.cache_capacity:,} tokens / "
         f"{args.cache_capacity // args.block_size:,} blocks)"
     )
-    if hybrid_model is not None:
-        print("HYBRID MEMORY MODEL (attention + mamba state):")
-        print(hybrid_model.summary())
+    if args.mamba_state_interval:
         print(
-            f"  cache capacity:            {capacity_bytes:,} B -> "
-            f"{cache_capacity_blocks:,} blocks"
+            f"  mamba checkpoints: every {args.mamba_state_interval} tokens "
+            f"(+ partial tail), {args.mamba_state_size:,} tokens each"
         )
     result = run_simulation(
         tokenizer, requests, args.block_size, args.cache_capacity,
         keep_prompts=keep_prompts,
         group_key=args.group_key,
         max_requests=args.max_requests,
-        cache_capacity_blocks=cache_capacity_blocks,
         cache_partial_tail=not args.no_tail_cache,
+        mamba_state_interval=args.mamba_state_interval,
+        mamba_state_size=args.mamba_state_size or 0,
     )
 
     # Print results
@@ -1094,12 +876,16 @@ def main():
         req_hit_rate = 0.0
     print(f"  Request hit rate:    {req_hit_rate:.6f} ({req_hit_rate*100:.2f}%)")
     print(f"  Block size:          {args.block_size} tokens")
-    print(f"  Cache capacity:      {result.cache_capacity_blocks:,} blocks")
-    if hybrid_model is not None:
-        used = result.cache_capacity_blocks * hybrid_model.per_block_bytes
+    print(
+        f"  Cache capacity:      {result.cache_capacity_tokens:,} tokens "
+        f"(usage at end: {result.cache_usage_tokens:,})"
+    )
+    print(f"  Cached blocks:       {result.cache_blocks:,}")
+    if result.mamba_state_interval:
         print(
-            f"  Cache memory:        {used / (1 << 30):.2f} GiB "
-            f"({hybrid_model.per_block_bytes:,} B/block)"
+            f"  Cached checkpoints:  {result.cache_checkpoints:,} "
+            f"(every {result.mamba_state_interval} tokens, "
+            f"{result.mamba_state_size:,} tokens each)"
         )
 
     # Per-request hit rate distribution

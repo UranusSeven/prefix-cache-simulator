@@ -42,61 +42,44 @@ python prefix_cache_simulator.py <log.jsonl> \
 | `--session-map` | no | — | JSON file mapping `trace_id` → `session_id` |
 | `--top-k-sessions` | no | 5 | Number of low-hit sessions to diagnose |
 
-### Hybrid (attention + mamba state) mode
+### Mamba state checkpoint mode (hybrid linear-attention models)
 
-For hybrid models like **Kimi-K3 / Kimi-Linear** (KDA linear attention + MLA
-full attention), vLLM caches one *mamba state checkpoint* per block boundary
-per mamba layer alongside the attention KV, in a single unified block pool
-(`mamba_cache_mode=align`). Mamba states are large (the fp32 recurrent state
-is `num_heads × head_dim²` per layer), so the per-block memory cost — not the
-token capacity — is what limits the cache.
-
-Enable hybrid mode with `--cache-capacity-bytes` plus either a model config
-or explicit layer sizes. The hit rule is unchanged (chained-hash prefix
-match); what changes is that capacity is a byte budget divided by the real
-per-block cost, and the block size is raised if one attention page cannot
-hold one mamba state (exactly what vLLM does in
-`_align_hybrid_block_size`).
+Hybrid models like **Kimi-K3 / Kimi-Linear** (KDA linear attention + MLA
+full attention) can only reuse a cached prefix if a **mamba state
+checkpoint** exists at the resume position — KV blocks alone are not enough.
+Enable checkpoint-aware simulation with two flags:
 
 ```bash
-# Derive everything from the model's HF config.json (Kimi-Linear style)
 python prefix_cache_simulator.py <log.jsonl> \
   --tokenizer <hf-tokenizer> \
-  --model-config <path-to-config.json> \
-  --cache-capacity-bytes 80GiB \
-  --dtype bf16 --tp-size 1 --num-speculative-tokens 0
-
-# Or specify the memory model explicitly
-python prefix_cache_simulator.py <log.jsonl> \
-  --tokenizer <hf-tokenizer> \
-  --cache-capacity-bytes 80GiB \
-  --num-attn-layers 15 --num-mamba-layers 45 \
-  --mamba-state-bytes 4341760 --attn-bytes-per-token 1152
+  --block-size 16 \
+  --mamba-state-interval 16 \
+  --mamba-state-size 4000
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--cache-capacity-bytes` | — | Pool capacity in bytes (`80GiB`, `1.5GB`, …). Enables hybrid mode |
-| `--model-config` | — | HF `config.json` with `linear_attn_config`; derives layer counts, KDA state bytes, MLA/full-attn KV bytes |
-| `--dtype` | bf16 | dtype for conv state and KV (recurrent state is always fp32, as in vLLM) |
-| `--num-speculative-tokens` | 0 | Widens the conv-state window (`kernel-1+num_spec`) |
-| `--tp-size` | 1 | Per-block state/KV divides by TP size |
-| `--kernel-block-alignment` | 16 | Alignment used when raising block size to fit a mamba page |
-| `--num-attn-layers` / `--num-mamba-layers` | — | Explicit layer counts (override config) |
-| `--mamba-state-bytes` | — | Explicit mamba state bytes per layer per block |
-| `--attn-bytes-per-token` | — | Explicit attention KV bytes per layer per token |
+| `--mamba-state-interval` | off | Store a mamba state checkpoint every N tokens; the final partial interval counts as a checkpoint. Set equal to `--block-size` to mirror vLLM's `mamba_cache_mode=align` |
+| `--mamba-state-size` | — | Capacity cost of one checkpoint, in token-equivalents (required with `--mamba-state-interval`) |
 | `--no-tail-cache` | off | Never cache the final partial block (vLLM align mode *does* cache the prompt's partial tail) |
 
-KDA state formula (per layer per block, mirroring vLLM's
-`MambaStateShapeCalculator.kda_state_shape`):
+Semantics, mirroring vLLM v1's `MambaManager`:
 
-```
-conv_state      = (H·d + 2·Hk·dk) × (conv_kernel − 1 + num_spec) × dtype_bytes
-recurrent_state = H × d × d × 4          # fp32, always
-```
+- **Hit rule**: the reusable prefix is the *newest cached checkpoint* covered
+  by the KV prefix match (checkpoints are scanned right-to-left — an SSM
+  only needs the latest state to resume). No cached checkpoint → 0 hits,
+  even if all KV blocks are cached.
+- **Capacity**: one shared LRU pool measured in tokens. Each KV block entry
+  costs `block_size` tokens; each checkpoint costs `--mamba-state-size`
+  tokens. Convert state bytes to token-equivalents with:
 
-Per-block pool cost = `(num_attn_layers + num_mamba_layers) × unified_page`,
-where `unified_page = max(attn_page, mamba_state)` after the block-size raise.
+  ```
+  mamba_state_size = total_state_bytes_across_mamba_layers
+                     / total_kv_bytes_per_token_across_attn_layers
+  ```
+
+  e.g. 45 KDA layers × 4.14 MiB state ÷ (15 MLA layers × 1152 B/token)
+  ≈ 10,800 tokens per checkpoint.
 
 Not modeled (second order for hit-rate estimation): the 2+spec resident
 blocks each in-flight request holds, and chunked-prefill boundary alignment.
