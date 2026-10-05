@@ -131,6 +131,20 @@ Semantics, mirroring vLLM v1's `MambaManager`:
 Not modeled (second order for hit-rate estimation): the 2+spec resident
 blocks each in-flight request holds, and chunked-prefill boundary alignment.
 
+**Sizing the pool from a byte budget.** The simulator's capacity unit is
+"one token of attention KV across all layers", so:
+
+```
+--cache-capacity   = pool_budget_bytes / kv_bytes_per_token_all_layers
+--mamba-state-size = checkpoint_bytes_all_mamba_layers / kv_bytes_per_token_all_layers
+```
+
+e.g. K3 with FP8 MLA KV: 24 × 576 × 1 B = 13.5 KB/token → a 500 GiB pool is
+`500·2³⁰ / 13,824` = 38,838,136 tokens, and the 428.6 MiB checkpoint costs
+`449,372,160 / 13,824` = 32,507 tokens (vs 16,253 at bf16 KV — FP8 halves
+the KV currency, so the same state costs 2× more). One 1536-token align
+block then costs 1536 + 32,507 tokens ≈ 470.6 MB, 95% of which is state.
+
 ### `build_session_map.py`
 
 Extracts trace ID → session ID mappings from request header logs (where `msg` contains the HTTP headers).
