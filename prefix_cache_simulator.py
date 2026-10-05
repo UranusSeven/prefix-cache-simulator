@@ -31,6 +31,13 @@ class ParsedRequest:
     prompt: str          # flattened text for fuzzy matching in session analysis
     model: str = ""
     group: str = ""
+    # Pre-blocked input (native format): block identities + token count,
+    # no tokenization needed. block_ids are content ids unique within
+    # `namespace` (e.g. a session); keys are chained per request.
+    block_ids: Optional[list] = None
+    namespace: str = ""
+    prompt_tokens: int = 0
+    req_block_size: Optional[int] = None
 
 
 def _decode_unicode_escapes(raw: str) -> str:
@@ -141,6 +148,24 @@ def parse_log_file(path: str, group_key: str | None = None) -> list[ParsedReques
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 errors += 1
+                continue
+
+            # Native pre-blocked format: block identities + token count,
+            # no request body or tokenization involved.
+            if isinstance(entry.get("block_ids"), list):
+                requests.append(ParsedRequest(
+                    trace_id=str(entry.get("trace_id", f"line_{lineno}")),
+                    timestamp=str(entry.get("timestamp", entry.get("ts", ""))),
+                    messages=[],
+                    prompt="",
+                    model=str(entry.get("model", "")),
+                    group=str(entry.get(group_key, entry.get("group", "")))
+                    if group_key else "",
+                    block_ids=entry["block_ids"],
+                    namespace=str(entry.get("namespace", "")),
+                    prompt_tokens=int(entry.get("prompt_tokens", 0)),
+                    req_block_size=entry.get("block_size"),
+                ))
                 continue
 
             body = _parse_request_body(entry)
@@ -301,6 +326,7 @@ class LRUPrefixCache:
         drop_tail: bool = False,
         checkpoint_keys: Optional[list[tuple[int, bytes]]] = None,
         checkpoint_cost: int = 0,
+        block_size: Optional[int] = None,
     ) -> int:
         """
         Simulate a prefix-cache lookup for one request.
@@ -317,7 +343,11 @@ class LRUPrefixCache:
         availability: the reusable prefix is the newest cached checkpoint
         position covered by the KV prefix match (a hybrid model cannot
         resume mid-sequence without a state checkpoint).
+
+        ``block_size`` overrides the pool's default block token cost (used
+        by pre-blocked inputs that carry their own block size).
         """
+        bs = block_size or self.block_size
         if drop_tail and block_keys:
             block_keys = block_keys[:-1]
 
@@ -328,7 +358,7 @@ class LRUPrefixCache:
                 # Hit — count tokens in this block
                 # Last block may be shorter, but we count block_size for
                 # uniformity (the caller tracks actual token counts).
-                kv_hit += self.block_size
+                kv_hit += bs
                 # Touch: move to end (most recently used)
                 self.cache.move_to_end(key)
             else:
@@ -348,7 +378,7 @@ class LRUPrefixCache:
 
         # Phase 3: write all entries into cache
         for key in block_keys:
-            self._store(key, self.block_size)
+            self._store(key, bs)
         if checkpoint_keys is not None:
             for _, key in checkpoint_keys:
                 self._store(key, checkpoint_cost, is_checkpoint=True)
@@ -388,6 +418,100 @@ def compute_checkpoint_keys(
                                        extra_keys=("mamba-checkpoint",))
         keys.append((min(start + interval, len(token_ids)), prev_hash))
     return keys
+
+
+def compute_block_keys_from_ids(block_ids: list, namespace: str = "") -> list[bytes]:
+    """
+    Chained-hash keys for pre-blocked input (one key per block id).
+
+    Uses a fast rolling sha256 over the raw id bytes rather than the
+    pickle-based vLLM-compatible scheme (token path), since id namespaces
+    are self-contained. `namespace` scopes ids that are only locally unique.
+    """
+    keys: list[bytes] = []
+    prev = _NONE_HASH
+    ns = namespace.encode() + b"|" if namespace else b""
+    for bid in block_ids:
+        prev = hashlib.sha256(prev + ns + str(bid).encode()).digest()
+        keys.append(prev)
+    return keys
+
+
+def compute_checkpoint_keys_from_ids(
+    block_ids: list,
+    block_size: int,
+    interval: int,
+    total_tokens: int,
+    namespace: str = "",
+) -> list[tuple[int, bytes]]:
+    """
+    Mamba checkpoints for pre-blocked input. A checkpoint is stored at a
+    block end whenever the block end crosses the next multiple of
+    `interval` tokens; the final block always counts (partial tail).
+    Positions are reported in tokens.
+    """
+    keys: list[tuple[int, bytes]] = []
+    prev = _NONE_HASH
+    ns = namespace.encode() + b"|cp|" if namespace else b"cp|"
+    next_cp = interval
+    for i, bid in enumerate(block_ids):
+        prev = hashlib.sha256(prev + ns + str(bid).encode()).digest()
+        pos = min((i + 1) * block_size, total_tokens)
+        if pos >= next_cp:
+            keys.append((pos, prev))
+            while next_cp <= pos:
+                next_cp += interval
+    # Final partial tail always counts as a checkpoint
+    if not keys or keys[-1][0] != total_tokens:
+        keys.append((total_tokens, prev))
+    return keys
+
+
+def iter_preblocked_requests(path: str, group_key: str | None = None):
+    """
+    Stream native pre-blocked JSONL (lines with "block_ids") as
+    ParsedRequests, in file order. Unlike parse_log_file this does not
+    hold all requests in memory and does not re-sort by timestamp — the
+    producer (e.g. weka_adapter.py) controls replay order.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry.get("block_ids"), list):
+                continue
+            yield ParsedRequest(
+                trace_id=str(entry.get("trace_id", f"line_{lineno}")),
+                timestamp=str(entry.get("timestamp", "")),
+                messages=[],
+                prompt="",
+                model=str(entry.get("model", "")),
+                group=str(entry.get(group_key, entry.get("group", "")))
+                if group_key else "",
+                block_ids=entry["block_ids"],
+                namespace=str(entry.get("namespace", "")),
+                prompt_tokens=int(entry.get("prompt_tokens", 0)),
+                req_block_size=entry.get("block_size"),
+            )
+
+
+def peek_preblocked(path: str) -> bool:
+    """True if the first non-empty line of the file has block_ids."""
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return isinstance(json.loads(line).get("block_ids"), list)
+            except json.JSONDecodeError:
+                return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +582,7 @@ class SimulationResult:
 
 def run_simulation(
     tokenizer,
-    requests: list[ParsedRequest],
+    requests,
     block_size: int,
     cache_capacity_tokens: int,
     keep_prompts: bool = False,
@@ -467,9 +591,13 @@ def run_simulation(
     cache_partial_tail: bool = True,
     mamba_state_interval: int | None = None,
     mamba_state_size: int = 0,
+    total_requests: int | None = None,
 ) -> SimulationResult:
     """
     Tokenize and simulate in a single streaming pass.
+
+    `requests` may be a list or a one-shot generator (streaming pre-blocked
+    input); *total_requests* is used only for progress display.
 
     Each request is tokenized, simulated, then its messages/prompt are freed
     to keep peak memory low.  If *keep_prompts* is True the ``prompt`` field
@@ -514,6 +642,7 @@ def run_simulation(
     t0 = time.time()
     total_tokens = 0
     fallback_count = 0
+    total_str = str(total_requests) if total_requests is not None else "?"
     for i, req in enumerate(requests):
         if interrupted:
             print(f"\n  interrupted by user after {i} requests")
@@ -522,43 +651,70 @@ def run_simulation(
             print(f"\n  stopped after --max-requests={max_requests}")
             break
         # --- tokenize one request ---
-        try:
-            tokens = tokenizer.apply_chat_template(
-                req.messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=False,
-            )
-        except Exception:
-            tokens = tokenizer.encode(req.prompt, add_special_tokens=False)
-            fallback_count += 1
+        if req.block_ids is not None:
+            # Pre-blocked input: block identities are given, no tokenization
+            tokens = None
+            bs_req = req.req_block_size or block_size
+            prompt_tokens = req.prompt_tokens or len(req.block_ids) * bs_req
+        else:
+            if tokenizer is None:
+                raise ValueError(
+                    f"request {req.trace_id} has no block_ids and no "
+                    f"--tokenizer was provided"
+                )
+            try:
+                tokens = tokenizer.apply_chat_template(
+                    req.messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    return_dict=False,
+                )
+            except Exception:
+                tokens = tokenizer.encode(req.prompt, add_special_tokens=False)
+                fallback_count += 1
+            bs_req = block_size
+            prompt_tokens = len(tokens)
 
-        total_tokens += len(tokens)
+        total_tokens += prompt_tokens
 
         # Free heavy fields immediately; keep prompt only if needed later
         req.messages = None  # type: ignore[assignment]
+        req_block_ids, req.block_ids = req.block_ids, None
         if not keep_prompts:
             req.prompt = None  # type: ignore[assignment]
 
-        if not tokens:
+        if not prompt_tokens:
             continue
 
         # --- simulate ---
-        block_keys = compute_block_keys(tokens, block_size)
-        drop_tail = not cache_partial_tail and len(tokens) % block_size != 0
-        checkpoint_keys = (
-            compute_checkpoint_keys(tokens, mamba_state_interval)
-            if mamba_state_interval
-            else None
-        )
+        if tokens is not None:
+            block_keys = compute_block_keys(tokens, bs_req)
+            drop_tail = (
+                not cache_partial_tail and len(tokens) % bs_req != 0
+            )
+            checkpoint_keys = (
+                compute_checkpoint_keys(tokens, mamba_state_interval)
+                if mamba_state_interval
+                else None
+            )
+        else:
+            block_keys = compute_block_keys_from_ids(req_block_ids)
+            drop_tail = False  # pre-blocked input: tail block already materialized
+            checkpoint_keys = (
+                compute_checkpoint_keys_from_ids(
+                    req_block_ids, bs_req, mamba_state_interval, prompt_tokens
+                )
+                if mamba_state_interval
+                else None
+            )
         cached_tokens = cache.query(
             block_keys,
             drop_tail=drop_tail,
             checkpoint_keys=checkpoint_keys,
             checkpoint_cost=mamba_state_size,
+            block_size=bs_req,
         )
 
-        prompt_tokens = len(tokens)
         cached_tokens = min(cached_tokens, prompt_tokens)
 
         # Per-group simulation
@@ -574,6 +730,7 @@ def run_simulation(
                 drop_tail=drop_tail,
                 checkpoint_keys=checkpoint_keys,
                 checkpoint_cost=mamba_state_size,
+                block_size=bs_req,
             )
             group_cached_tokens = min(group_cached_tokens, prompt_tokens)
 
@@ -602,7 +759,7 @@ def run_simulation(
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
             print(
-                f"\r  processing: {i + 1}/{len(requests)} "
+                f"\r  processing: {i + 1}/{total_str} "
                 f"hit_rate={result.hit_rate:.4f} "
                 f"cache_blocks={len(cache.cache):,} "
                 f"({(i + 1) / max(elapsed, 1e-9):.0f} req/s)",
@@ -761,7 +918,9 @@ def main():
     )
     parser.add_argument("log_file", help="JSONL log file path")
     parser.add_argument(
-        "--tokenizer", required=True, help="HuggingFace tokenizer path or name"
+        "--tokenizer",
+        help="HuggingFace tokenizer path or name (not needed for pre-blocked "
+        "input with block_ids)",
     )
     parser.add_argument(
         "--block-size", type=int, default=16,
@@ -828,21 +987,45 @@ def main():
 
     # 1. Parse log
     print(f"[1/3] Parsing log file: {args.log_file}")
-    requests = parse_log_file(args.log_file, group_key=args.group_key)
-    if not requests:
-        print("No valid requests found. Exiting.")
-        sys.exit(1)
+    preblocked = peek_preblocked(args.log_file)
+    if preblocked:
+        # Streaming replay in file order (no global re-sort, no full in-
+        # memory parse) — the producer controls request ordering.
+        requests = iter_preblocked_requests(args.log_file, args.group_key)
+        total_requests = None
+        needs_tokenizer = False
+    else:
+        requests = parse_log_file(args.log_file, group_key=args.group_key)
+        if not requests:
+            print("No valid requests found. Exiting.")
+            sys.exit(1)
+        total_requests = len(requests)
+        needs_tokenizer = any(r.block_ids is None for r in requests)
 
-    # 2. Load tokenizer
-    print(f"\n[2/3] Loading tokenizer: {args.tokenizer}")
-    tokenizer = load_tokenizer(args.tokenizer)
+    # 2. Load tokenizer (only needed for text requests; pre-blocked input
+    #    with block_ids skips tokenization entirely)
+    if needs_tokenizer:
+        if not args.tokenizer:
+            parser.error(
+                "--tokenizer is required unless all input lines are "
+                "pre-blocked (block_ids)"
+            )
+        print(f"\n[2/3] Loading tokenizer: {args.tokenizer}")
+        tokenizer = load_tokenizer(args.tokenizer)
+    else:
+        print("\n[2/3] Pre-blocked input (block_ids); tokenizer not needed")
+        tokenizer = None
 
     # 3. Tokenize + simulate in one streaming pass (avoids holding all token
     #    lists in memory at once).
     keep_prompts = bool(args.session_map)
+    n_str = (
+        f"{total_requests} requests" if total_requests is not None
+        else "streaming requests"
+    )
     print(
         f"\n[3/3] Tokenizing & simulating "
-        f"({len(requests)} requests, "
+        f"({n_str}, "
         f"block_size={args.block_size}, "
         f"cache_capacity={args.cache_capacity:,} tokens / "
         f"{args.cache_capacity // args.block_size:,} blocks)"
@@ -860,6 +1043,7 @@ def main():
         cache_partial_tail=not args.no_tail_cache,
         mamba_state_interval=args.mamba_state_interval,
         mamba_state_size=args.mamba_state_size or 0,
+        total_requests=total_requests,
     )
 
     # Print results
@@ -928,14 +1112,15 @@ def main():
                 f"{gr.hit_rate:>10.4f} {gr.request_hit_rate:>10.4f}"
             )
 
-    # Session analysis (optional)
-    if args.session_map:
+    # Session analysis (optional; requires text prompts, so not available
+    # for pre-blocked input)
+    if args.session_map and not preblocked:
         print(f"\nSession analysis (map: {args.session_map})")
         with open(args.session_map, "r") as f:
             session_map = json.load(f)
         analyze_sessions(result, session_map, requests, args.top_k_sessions)
     else:
-        print("\nSession analysis skipped (no --session-map provided)")
+        print("\nSession analysis skipped")
 
 
 if __name__ == "__main__":

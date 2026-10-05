@@ -29,6 +29,49 @@ python prefix_cache_simulator.py <log.jsonl> \
   --session-map session_map.json
 ```
 
+## Pre-blocked input (trace replay without a tokenizer)
+
+If a log line contains a `block_ids` list, the simulator skips tokenization
+and treats each id as one content-addressed block:
+
+```json
+{"trace_id": "s1-00000", "timestamp": "0000000000000.000000",
+ "group": "s1", "namespace": "s1", "block_size": 1536,
+ "prompt_tokens": 63744, "block_ids": ["0,1,2,...", "..."]}
+```
+
+- `block_ids`: content ids, equal iff the block content is equal. They only
+  need to be unique within `namespace` (e.g. a session); the simulator
+  chain-hashes them per request.
+- `block_size` / `prompt_tokens`: per-request overrides (tokens).
+- When **all** lines are pre-blocked, `--tokenizer` is not needed and replay
+  streams the file in order (no in-memory global re-sort), so arbitrarily
+  large traces work.
+
+### WekaTrace adapter
+
+`weka_adapter.py` converts
+[semianalysisai/cc-traces-weka](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k)
+session traces (64-token content-hash blocks, main + subagent requests) to
+the pre-blocked format:
+
+```bash
+# native 64-token granularity
+python weka_adapter.py traces.jsonl -o requests_b64.jsonl
+
+# regroup 24 x 64-token blocks into 1536-token superblocks (Kimi-K3 TP8,
+# where the mamba state page forces a 1536-token block)
+python weka_adapter.py traces.jsonl -o requests_b1536.jsonl --superblock-tokens 1536
+
+# Kimi-K3-style hybrid run: checkpoint per block (vLLM align mode)
+python prefix_cache_simulator.py requests_b1536.jsonl \
+  --block-size 1536 --cache-capacity 500000000 \
+  --mamba-state-interval 1536 --mamba-state-size 11300
+```
+
+A superblock is identified by the ordered tuple of its source block ids, so
+a superblock hit requires equality of all 24 contained 64-token blocks.
+
 ## Arguments
 
 ### `prefix_cache_simulator.py`
@@ -79,7 +122,8 @@ Semantics, mirroring vLLM v1's `MambaManager`:
   ```
 
   e.g. 45 KDA layers × 4.14 MiB state ÷ (15 MLA layers × 1152 B/token)
-  ≈ 10,800 tokens per checkpoint.
+  ≈ 11,300 tokens per checkpoint (TP-invariant: state and KV both shrink
+  with TP, so the ratio is unchanged at TP8).
 
 Not modeled (second order for hit-rate estimation): the 2+spec resident
 blocks each in-flight request holds, and chunked-prefill boundary alignment.
