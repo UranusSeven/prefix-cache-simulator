@@ -11,6 +11,7 @@ import difflib
 import hashlib
 import json
 import pickle
+import signal
 import sys
 import time
 from collections import OrderedDict, defaultdict
@@ -30,6 +31,13 @@ class ParsedRequest:
     prompt: str          # flattened text for fuzzy matching in session analysis
     model: str = ""
     group: str = ""
+    # Pre-blocked input (native format): block identities + token count,
+    # no tokenization needed. block_ids are content ids unique within
+    # `namespace` (e.g. a session); keys are chained per request.
+    block_ids: Optional[list] = None
+    namespace: str = ""
+    prompt_tokens: int = 0
+    req_block_size: Optional[int] = None
 
 
 def _decode_unicode_escapes(raw: str) -> str:
@@ -140,6 +148,24 @@ def parse_log_file(path: str, group_key: str | None = None) -> list[ParsedReques
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 errors += 1
+                continue
+
+            # Native pre-blocked format: block identities + token count,
+            # no request body or tokenization involved.
+            if isinstance(entry.get("block_ids"), list):
+                requests.append(ParsedRequest(
+                    trace_id=str(entry.get("trace_id", f"line_{lineno}")),
+                    timestamp=str(entry.get("timestamp", entry.get("ts", ""))),
+                    messages=[],
+                    prompt="",
+                    model=str(entry.get("model", "")),
+                    group=str(entry.get(group_key, entry.get("group", "")))
+                    if group_key else "",
+                    block_ids=entry["block_ids"],
+                    namespace=str(entry.get("namespace", "")),
+                    prompt_tokens=int(entry.get("prompt_tokens", 0)),
+                    req_block_size=entry.get("block_size"),
+                ))
                 continue
 
             body = _parse_request_body(entry)
@@ -256,47 +282,236 @@ def compute_block_keys(token_ids: list[int], block_size: int) -> list[bytes]:
 
 class LRUPrefixCache:
     """
-    LRU cache keyed by chained block hashes.
-    Capacity is measured in number of blocks.
+    LRU cache keyed by chained block hashes, optionally also holding mamba
+    state checkpoint entries.
+
+    Capacity and entry costs are all measured in tokens: a KV block entry
+    costs ``block_size`` tokens, a mamba checkpoint entry costs
+    ``mamba_state_size`` tokens (the caller converts state bytes to
+    token-equivalents — see README).
     """
 
-    def __init__(self, capacity_blocks: int):
-        self.capacity = capacity_blocks
-        self.cache: OrderedDict[bytes, None] = OrderedDict()
+    def __init__(self, capacity_tokens: int, block_size: int):
+        self.capacity = capacity_tokens
+        self.block_size = block_size
+        self.cache: OrderedDict[bytes, tuple[int, bool]] = OrderedDict()
+        # key -> (cost in tokens, is_checkpoint)
+        self.usage = 0
+        self.num_blocks = 0
+        self.num_checkpoints = 0
+
+    def _store(self, key: bytes, cost: int, is_checkpoint: bool = False) -> None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return
+        if cost > self.capacity:
+            return  # single entry larger than the pool: never cached
+        self.cache[key] = (cost, is_checkpoint)
+        self.usage += cost
+        if is_checkpoint:
+            self.num_checkpoints += 1
+        else:
+            self.num_blocks += 1
+        while self.usage > self.capacity:
+            _, (evicted_cost, evicted_is_cp) = self.cache.popitem(last=False)
+            self.usage -= evicted_cost
+            if evicted_is_cp:
+                self.num_checkpoints -= 1
+            else:
+                self.num_blocks -= 1
 
     def query(
-        self, block_keys: list[int], block_size: int
+        self,
+        block_keys: list[bytes],
+        drop_tail: bool = False,
+        checkpoint_keys: Optional[list[tuple[int, bytes]]] = None,
+        checkpoint_cost: int = 0,
+        block_size: Optional[int] = None,
     ) -> int:
         """
         Simulate a prefix-cache lookup for one request.
 
         Returns the number of cached (hit) tokens.
-        After the lookup, ALL blocks are written/updated in the cache.
-        """
-        cached_tokens = 0
+        After the lookup, ALL entries are written/updated in the cache.
 
-        # Phase 1: prefix match — sequential check, stop at first miss
-        for i, key in enumerate(block_keys):
+        With ``drop_tail=True`` the final key (partial tail block) is
+        neither read nor written, modeling engines that only cache full
+        blocks.
+
+        ``checkpoint_keys`` is a list of (token_position, key) pairs for
+        mamba state checkpoints. When given, the hit is gated on state
+        availability: the reusable prefix is the newest cached checkpoint
+        position covered by the KV prefix match (a hybrid model cannot
+        resume mid-sequence without a state checkpoint).
+
+        ``block_size`` overrides the pool's default block token cost (used
+        by pre-blocked inputs that carry their own block size).
+        """
+        bs = block_size or self.block_size
+        if drop_tail and block_keys:
+            block_keys = block_keys[:-1]
+
+        # Phase 1: KV prefix match — sequential check, stop at first miss
+        kv_hit = 0
+        for key in block_keys:
             if key in self.cache:
                 # Hit — count tokens in this block
                 # Last block may be shorter, but we count block_size for
                 # uniformity (the caller tracks actual token counts).
-                cached_tokens += block_size
+                kv_hit += bs
                 # Touch: move to end (most recently used)
                 self.cache.move_to_end(key)
             else:
                 break  # first miss stops prefix matching
 
-        # Phase 2: write all blocks into cache
-        for key in block_keys:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            else:
-                self.cache[key] = None
-                if len(self.cache) > self.capacity:
-                    self.cache.popitem(last=False)  # evict LRU
+        # Phase 2: gate on the newest cached mamba checkpoint within the
+        # KV-matched prefix (scan right to left, like vLLM's MambaManager).
+        if checkpoint_keys is not None:
+            hit = 0
+            for pos, key in reversed(checkpoint_keys):
+                if pos <= kv_hit and key in self.cache:
+                    hit = pos
+                    self.cache.move_to_end(key)
+                    break
+        else:
+            hit = kv_hit
 
-        return cached_tokens
+        # Phase 3: write all entries into cache
+        for key in block_keys:
+            self._store(key, bs)
+        if checkpoint_keys is not None:
+            for _, key in checkpoint_keys:
+                self._store(key, checkpoint_cost, is_checkpoint=True)
+
+        return hit
+
+
+# ---------------------------------------------------------------------------
+# Mamba state checkpoints
+#
+# Hybrid linear-attention models (Kimi-K3 / Kimi-Linear: KDA + MLA) can only
+# reuse a cached prefix if a mamba/linear state checkpoint exists at the
+# resume position. vLLM's mamba_cache_mode="align" stores one checkpoint per
+# block boundary (plus the prompt's partial tail); this simulator makes the
+# granularity explicit via --mamba-state-interval and charges each checkpoint
+# --mamba-state-size tokens of pool capacity.
+# ---------------------------------------------------------------------------
+
+def compute_checkpoint_keys(
+    token_ids: list[int], interval: int
+) -> list[tuple[int, bytes]]:
+    """
+    Split token_ids into intervals of `interval` tokens and produce a
+    chained-hash checkpoint key for each interval boundary. The final
+    partial interval counts as a checkpoint (position == len(token_ids)).
+
+    Checkpoint keys live in their own hash namespace (extra_keys marker) so
+    they stay distinct cache entries even when interval == block_size.
+
+    Returns a list of (token_position, key) pairs, ascending by position.
+    """
+    keys: list[tuple[int, bytes]] = []
+    prev_hash = _NONE_HASH
+    for start in range(0, len(token_ids), interval):
+        chunk = tuple(token_ids[start : start + interval])
+        prev_hash = _hash_block_tokens(prev_hash, chunk,
+                                       extra_keys=("mamba-checkpoint",))
+        keys.append((min(start + interval, len(token_ids)), prev_hash))
+    return keys
+
+
+def compute_block_keys_from_ids(block_ids: list, namespace: str = "") -> list[bytes]:
+    """
+    Chained-hash keys for pre-blocked input (one key per block id).
+
+    Uses a fast rolling sha256 over the raw id bytes rather than the
+    pickle-based vLLM-compatible scheme (token path), since id namespaces
+    are self-contained. `namespace` scopes ids that are only locally unique.
+    """
+    keys: list[bytes] = []
+    prev = _NONE_HASH
+    ns = namespace.encode() + b"|" if namespace else b""
+    for bid in block_ids:
+        prev = hashlib.sha256(prev + ns + str(bid).encode()).digest()
+        keys.append(prev)
+    return keys
+
+
+def compute_checkpoint_keys_from_ids(
+    block_ids: list,
+    block_size: int,
+    interval: int,
+    total_tokens: int,
+    namespace: str = "",
+) -> list[tuple[int, bytes]]:
+    """
+    Mamba checkpoints for pre-blocked input. A checkpoint is stored at a
+    block end whenever the block end crosses the next multiple of
+    `interval` tokens; the final block always counts (partial tail).
+    Positions are reported in tokens.
+    """
+    keys: list[tuple[int, bytes]] = []
+    prev = _NONE_HASH
+    ns = namespace.encode() + b"|cp|" if namespace else b"cp|"
+    next_cp = interval
+    for i, bid in enumerate(block_ids):
+        prev = hashlib.sha256(prev + ns + str(bid).encode()).digest()
+        pos = min((i + 1) * block_size, total_tokens)
+        if pos >= next_cp:
+            keys.append((pos, prev))
+            while next_cp <= pos:
+                next_cp += interval
+    # Final partial tail always counts as a checkpoint
+    if not keys or keys[-1][0] != total_tokens:
+        keys.append((total_tokens, prev))
+    return keys
+
+
+def iter_preblocked_requests(path: str, group_key: str | None = None):
+    """
+    Stream native pre-blocked JSONL (lines with "block_ids") as
+    ParsedRequests, in file order. Unlike parse_log_file this does not
+    hold all requests in memory and does not re-sort by timestamp — the
+    producer (e.g. weka_adapter.py) controls replay order.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry.get("block_ids"), list):
+                continue
+            yield ParsedRequest(
+                trace_id=str(entry.get("trace_id", f"line_{lineno}")),
+                timestamp=str(entry.get("timestamp", "")),
+                messages=[],
+                prompt="",
+                model=str(entry.get("model", "")),
+                group=str(entry.get(group_key, entry.get("group", "")))
+                if group_key else "",
+                block_ids=entry["block_ids"],
+                namespace=str(entry.get("namespace", "")),
+                prompt_tokens=int(entry.get("prompt_tokens", 0)),
+                req_block_size=entry.get("block_size"),
+            )
+
+
+def peek_preblocked(path: str) -> bool:
+    """True if the first non-empty line of the file has block_ids."""
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return isinstance(json.loads(line).get("block_ids"), list)
+            except json.JSONDecodeError:
+                return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +560,14 @@ class GroupResult:
 @dataclass
 class SimulationResult:
     block_size: int
-    cache_capacity_blocks: int
+    cache_capacity_tokens: int
     total_prompt_tokens: int
     total_cached_tokens: int
+    mamba_state_interval: int | None = None
+    mamba_state_size: int = 0
+    cache_usage_tokens: int = 0
+    cache_blocks: int = 0
+    cache_checkpoints: int = 0
     per_request: list[RequestResult] = field(default_factory=list)
     grouped: dict[str, GroupResult] = field(default_factory=dict)
 
@@ -362,14 +582,22 @@ class SimulationResult:
 
 def run_simulation(
     tokenizer,
-    requests: list[ParsedRequest],
+    requests,
     block_size: int,
     cache_capacity_tokens: int,
     keep_prompts: bool = False,
     group_key: str | None = None,
+    max_requests: int | None = None,
+    cache_partial_tail: bool = True,
+    mamba_state_interval: int | None = None,
+    mamba_state_size: int = 0,
+    total_requests: int | None = None,
 ) -> SimulationResult:
     """
     Tokenize and simulate in a single streaming pass.
+
+    `requests` may be a list or a one-shot generator (streaming pre-blocked
+    input); *total_requests* is used only for progress display.
 
     Each request is tokenized, simulated, then its messages/prompt are freed
     to keep peak memory low.  If *keep_prompts* is True the ``prompt`` field
@@ -377,51 +605,116 @@ def run_simulation(
 
     When *group_key* is set, each unique group value gets its own LRU cache
     and per-group statistics are tracked alongside the global cache.
+
+    *cache_partial_tail=False* models engines that never cache the final
+    partial block.
+
+    When *mamba_state_interval* is set, the simulation also stores a mamba
+    state checkpoint every *mamba_state_interval* tokens (the final partial
+    interval counts as a checkpoint), each charging *mamba_state_size*
+    tokens of pool capacity, and a request's reusable prefix is gated on
+    the newest cached checkpoint covered by its KV prefix match.
     """
-    cache_capacity_blocks = cache_capacity_tokens // block_size
-    cache = LRUPrefixCache(cache_capacity_blocks)
+    cache = LRUPrefixCache(cache_capacity_tokens, block_size)
 
     # Per-group caches (created on demand)
     group_caches: dict[str, LRUPrefixCache] = {}
 
     result = SimulationResult(
         block_size=block_size,
-        cache_capacity_blocks=cache_capacity_blocks,
+        cache_capacity_tokens=cache_capacity_tokens,
         total_prompt_tokens=0,
         total_cached_tokens=0,
+        mamba_state_interval=mamba_state_interval,
+        mamba_state_size=mamba_state_size,
     )
+
+    # Support early stop via Ctrl-C
+    interrupted = False
+    original_handler = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGINT, _sigint_handler)
 
     t0 = time.time()
     total_tokens = 0
     fallback_count = 0
+    total_str = str(total_requests) if total_requests is not None else "?"
     for i, req in enumerate(requests):
+        if interrupted:
+            print(f"\n  interrupted by user after {i} requests")
+            break
+        if max_requests is not None and i >= max_requests:
+            print(f"\n  stopped after --max-requests={max_requests}")
+            break
         # --- tokenize one request ---
-        try:
-            tokens = tokenizer.apply_chat_template(
-                req.messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=False,
-            )
-        except Exception:
-            tokens = tokenizer.encode(req.prompt, add_special_tokens=False)
-            fallback_count += 1
+        if req.block_ids is not None:
+            # Pre-blocked input: block identities are given, no tokenization
+            tokens = None
+            bs_req = req.req_block_size or block_size
+            prompt_tokens = req.prompt_tokens or len(req.block_ids) * bs_req
+        else:
+            if tokenizer is None:
+                raise ValueError(
+                    f"request {req.trace_id} has no block_ids and no "
+                    f"--tokenizer was provided"
+                )
+            try:
+                tokens = tokenizer.apply_chat_template(
+                    req.messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    return_dict=False,
+                )
+            except Exception:
+                tokens = tokenizer.encode(req.prompt, add_special_tokens=False)
+                fallback_count += 1
+            bs_req = block_size
+            prompt_tokens = len(tokens)
 
-        total_tokens += len(tokens)
+        total_tokens += prompt_tokens
 
         # Free heavy fields immediately; keep prompt only if needed later
         req.messages = None  # type: ignore[assignment]
+        req_block_ids, req.block_ids = req.block_ids, None
         if not keep_prompts:
             req.prompt = None  # type: ignore[assignment]
 
-        if not tokens:
+        if not prompt_tokens:
             continue
 
         # --- simulate ---
-        block_keys = compute_block_keys(tokens, block_size)
-        cached_tokens = cache.query(block_keys, block_size)
+        if tokens is not None:
+            block_keys = compute_block_keys(tokens, bs_req)
+            drop_tail = (
+                not cache_partial_tail and len(tokens) % bs_req != 0
+            )
+            checkpoint_keys = (
+                compute_checkpoint_keys(tokens, mamba_state_interval)
+                if mamba_state_interval
+                else None
+            )
+        else:
+            block_keys = compute_block_keys_from_ids(req_block_ids)
+            drop_tail = False  # pre-blocked input: tail block already materialized
+            checkpoint_keys = (
+                compute_checkpoint_keys_from_ids(
+                    req_block_ids, bs_req, mamba_state_interval, prompt_tokens
+                )
+                if mamba_state_interval
+                else None
+            )
+        cached_tokens = cache.query(
+            block_keys,
+            drop_tail=drop_tail,
+            checkpoint_keys=checkpoint_keys,
+            checkpoint_cost=mamba_state_size,
+            block_size=bs_req,
+        )
 
-        prompt_tokens = len(tokens)
         cached_tokens = min(cached_tokens, prompt_tokens)
 
         # Per-group simulation
@@ -429,8 +722,16 @@ def run_simulation(
         if group_key:
             group_val = req.group
             if group_val not in group_caches:
-                group_caches[group_val] = LRUPrefixCache(cache_capacity_blocks)
-            group_cached_tokens = group_caches[group_val].query(block_keys, block_size)
+                group_caches[group_val] = LRUPrefixCache(
+                    cache_capacity_tokens, block_size
+                )
+            group_cached_tokens = group_caches[group_val].query(
+                block_keys,
+                drop_tail=drop_tail,
+                checkpoint_keys=checkpoint_keys,
+                checkpoint_cost=mamba_state_size,
+                block_size=bs_req,
+            )
             group_cached_tokens = min(group_cached_tokens, prompt_tokens)
 
         result.total_prompt_tokens += prompt_tokens
@@ -458,12 +759,18 @@ def run_simulation(
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
             print(
-                f"\r  processing: {i + 1}/{len(requests)} "
+                f"\r  processing: {i + 1}/{total_str} "
                 f"hit_rate={result.hit_rate:.4f} "
                 f"cache_blocks={len(cache.cache):,} "
                 f"({(i + 1) / max(elapsed, 1e-9):.0f} req/s)",
                 end="", flush=True,
             )
+
+    signal.signal(signal.SIGINT, original_handler)
+
+    result.cache_usage_tokens = cache.usage
+    result.cache_blocks = cache.num_blocks
+    result.cache_checkpoints = cache.num_checkpoints
 
     elapsed = time.time() - t0
     fallback_msg = f", {fallback_count} fallback" if fallback_count else ""
@@ -611,7 +918,9 @@ def main():
     )
     parser.add_argument("log_file", help="JSONL log file path")
     parser.add_argument(
-        "--tokenizer", required=True, help="HuggingFace tokenizer path or name"
+        "--tokenizer",
+        help="HuggingFace tokenizer path or name (not needed for pre-blocked "
+        "input with block_ids)",
     )
     parser.add_argument(
         "--block-size", type=int, default=16,
@@ -626,6 +935,10 @@ def main():
         help="Root-level JSONL field to group by (each group gets its own LRU cache)",
     )
     parser.add_argument(
+        "--max-requests", type=int, default=None,
+        help="Stop simulation after processing this many requests",
+    )
+    parser.add_argument(
         "--session-map",
         help="JSON file mapping trace_id -> session_id",
     )
@@ -633,33 +946,104 @@ def main():
         "--top-k-sessions", type=int, default=5,
         help="Number of low-hit sessions to analyze (default: 5)",
     )
+
+    # --- Mamba state checkpoint model (hybrid linear-attention models) ---
+    mamba = parser.add_argument_group(
+        "mamba state checkpoints",
+        "For hybrid linear-attention models (Kimi-K3 / Kimi-Linear: KDA + "
+        "MLA), a cached prefix is only reusable up to a stored mamba state "
+        "checkpoint. Checkpoints are stored every --mamba-state-interval "
+        "tokens (the final partial interval counts) and each charges "
+        "--mamba-state-size tokens of pool capacity.",
+    )
+    mamba.add_argument(
+        "--mamba-state-interval", type=int, default=None,
+        help="Store a mamba state checkpoint every N tokens. Set equal to "
+        "--block-size to mirror vLLM's mamba_cache_mode=align.",
+    )
+    mamba.add_argument(
+        "--mamba-state-size", type=int, default=None,
+        help="Capacity cost of one checkpoint, in token-equivalents: "
+        "total_state_bytes_across_layers / total_kv_bytes_per_token_"
+        "across_layers. Required with --mamba-state-interval.",
+    )
+    parser.add_argument(
+        "--no-tail-cache", action="store_true",
+        help="Never cache the final partial block (vLLM mamba align mode "
+        "does cache the partial tail; this models engines that don't).",
+    )
     args = parser.parse_args()
+
+    if args.mamba_state_interval is not None:
+        if args.mamba_state_interval <= 0:
+            parser.error("--mamba-state-interval must be positive")
+        if args.mamba_state_size is None:
+            parser.error("--mamba-state-interval requires --mamba-state-size")
+        if args.mamba_state_size < 0:
+            parser.error("--mamba-state-size must be >= 0")
+    elif args.mamba_state_size is not None:
+        parser.error("--mamba-state-size only makes sense with "
+                     "--mamba-state-interval")
 
     # 1. Parse log
     print(f"[1/3] Parsing log file: {args.log_file}")
-    requests = parse_log_file(args.log_file, group_key=args.group_key)
-    if not requests:
-        print("No valid requests found. Exiting.")
-        sys.exit(1)
+    preblocked = peek_preblocked(args.log_file)
+    if preblocked:
+        # Streaming replay in file order (no global re-sort, no full in-
+        # memory parse) — the producer controls request ordering.
+        requests = iter_preblocked_requests(args.log_file, args.group_key)
+        total_requests = None
+        needs_tokenizer = False
+    else:
+        requests = parse_log_file(args.log_file, group_key=args.group_key)
+        if not requests:
+            print("No valid requests found. Exiting.")
+            sys.exit(1)
+        total_requests = len(requests)
+        needs_tokenizer = any(r.block_ids is None for r in requests)
 
-    # 2. Load tokenizer
-    print(f"\n[2/3] Loading tokenizer: {args.tokenizer}")
-    tokenizer = load_tokenizer(args.tokenizer)
+    # 2. Load tokenizer (only needed for text requests; pre-blocked input
+    #    with block_ids skips tokenization entirely)
+    if needs_tokenizer:
+        if not args.tokenizer:
+            parser.error(
+                "--tokenizer is required unless all input lines are "
+                "pre-blocked (block_ids)"
+            )
+        print(f"\n[2/3] Loading tokenizer: {args.tokenizer}")
+        tokenizer = load_tokenizer(args.tokenizer)
+    else:
+        print("\n[2/3] Pre-blocked input (block_ids); tokenizer not needed")
+        tokenizer = None
 
     # 3. Tokenize + simulate in one streaming pass (avoids holding all token
     #    lists in memory at once).
     keep_prompts = bool(args.session_map)
+    n_str = (
+        f"{total_requests} requests" if total_requests is not None
+        else "streaming requests"
+    )
     print(
         f"\n[3/3] Tokenizing & simulating "
-        f"({len(requests)} requests, "
+        f"({n_str}, "
         f"block_size={args.block_size}, "
         f"cache_capacity={args.cache_capacity:,} tokens / "
         f"{args.cache_capacity // args.block_size:,} blocks)"
     )
+    if args.mamba_state_interval:
+        print(
+            f"  mamba checkpoints: every {args.mamba_state_interval} tokens "
+            f"(+ partial tail), {args.mamba_state_size:,} tokens each"
+        )
     result = run_simulation(
         tokenizer, requests, args.block_size, args.cache_capacity,
         keep_prompts=keep_prompts,
         group_key=args.group_key,
+        max_requests=args.max_requests,
+        cache_partial_tail=not args.no_tail_cache,
+        mamba_state_interval=args.mamba_state_interval,
+        mamba_state_size=args.mamba_state_size or 0,
+        total_requests=total_requests,
     )
 
     # Print results
@@ -676,7 +1060,17 @@ def main():
         req_hit_rate = 0.0
     print(f"  Request hit rate:    {req_hit_rate:.6f} ({req_hit_rate*100:.2f}%)")
     print(f"  Block size:          {args.block_size} tokens")
-    print(f"  Cache capacity:      {result.cache_capacity_blocks:,} blocks")
+    print(
+        f"  Cache capacity:      {result.cache_capacity_tokens:,} tokens "
+        f"(usage at end: {result.cache_usage_tokens:,})"
+    )
+    print(f"  Cached blocks:       {result.cache_blocks:,}")
+    if result.mamba_state_interval:
+        print(
+            f"  Cached checkpoints:  {result.cache_checkpoints:,} "
+            f"(every {result.mamba_state_interval} tokens, "
+            f"{result.mamba_state_size:,} tokens each)"
+        )
 
     # Per-request hit rate distribution
     if result.per_request:
@@ -718,14 +1112,15 @@ def main():
                 f"{gr.hit_rate:>10.4f} {gr.request_hit_rate:>10.4f}"
             )
 
-    # Session analysis (optional)
-    if args.session_map:
+    # Session analysis (optional; requires text prompts, so not available
+    # for pre-blocked input)
+    if args.session_map and not preblocked:
         print(f"\nSession analysis (map: {args.session_map})")
         with open(args.session_map, "r") as f:
             session_map = json.load(f)
         analyze_sessions(result, session_map, requests, args.top_k_sessions)
     else:
-        print("\nSession analysis skipped (no --session-map provided)")
+        print("\nSession analysis skipped")
 
 
 if __name__ == "__main__":

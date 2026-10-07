@@ -29,6 +29,49 @@ python prefix_cache_simulator.py <log.jsonl> \
   --session-map session_map.json
 ```
 
+## Pre-blocked input (trace replay without a tokenizer)
+
+If a log line contains a `block_ids` list, the simulator skips tokenization
+and treats each id as one content-addressed block:
+
+```json
+{"trace_id": "s1-00000", "timestamp": "0000000000000.000000",
+ "group": "s1", "namespace": "s1", "block_size": 1536,
+ "prompt_tokens": 63744, "block_ids": ["0,1,2,...", "..."]}
+```
+
+- `block_ids`: content ids, equal iff the block content is equal. They only
+  need to be unique within `namespace` (e.g. a session); the simulator
+  chain-hashes them per request.
+- `block_size` / `prompt_tokens`: per-request overrides (tokens).
+- When **all** lines are pre-blocked, `--tokenizer` is not needed and replay
+  streams the file in order (no in-memory global re-sort), so arbitrarily
+  large traces work.
+
+### WekaTrace adapter
+
+`weka_adapter.py` converts
+[semianalysisai/cc-traces-weka](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k)
+session traces (64-token content-hash blocks, main + subagent requests) to
+the pre-blocked format:
+
+```bash
+# native 64-token granularity
+python weka_adapter.py traces.jsonl -o requests_b64.jsonl
+
+# regroup 24 x 64-token blocks into 1536-token superblocks (Kimi-K3 TP8,
+# where the mamba state page forces a 1536-token block)
+python weka_adapter.py traces.jsonl -o requests_b1536.jsonl --superblock-tokens 1536
+
+# Kimi-K3-style hybrid run: checkpoint per block (vLLM align mode)
+python prefix_cache_simulator.py requests_b1536.jsonl \
+  --block-size 1536 --cache-capacity 500000000 \
+  --mamba-state-interval 1536 --mamba-state-size 16253
+```
+
+A superblock is identified by the ordered tuple of its source block ids, so
+a superblock hit requires equality of all 24 contained 64-token blocks.
+
 ## Arguments
 
 ### `prefix_cache_simulator.py`
@@ -41,6 +84,66 @@ python prefix_cache_simulator.py <log.jsonl> \
 | `--cache-capacity` | no | 200,000,000 | LRU cache capacity in tokens |
 | `--session-map` | no | — | JSON file mapping `trace_id` → `session_id` |
 | `--top-k-sessions` | no | 5 | Number of low-hit sessions to diagnose |
+
+### Mamba state checkpoint mode (hybrid linear-attention models)
+
+Hybrid models like **Kimi-K3 / Kimi-Linear** (KDA linear attention + MLA
+full attention) can only reuse a cached prefix if a **mamba state
+checkpoint** exists at the resume position — KV blocks alone are not enough.
+Enable checkpoint-aware simulation with two flags:
+
+```bash
+python prefix_cache_simulator.py <log.jsonl> \
+  --tokenizer <hf-tokenizer> \
+  --block-size 16 \
+  --mamba-state-interval 16 \
+  --mamba-state-size 4000
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--mamba-state-interval` | off | Store a mamba state checkpoint every N tokens; the final partial interval counts as a checkpoint. Set equal to `--block-size` to mirror vLLM's `mamba_cache_mode=align` |
+| `--mamba-state-size` | — | Capacity cost of one checkpoint, in token-equivalents (required with `--mamba-state-interval`) |
+| `--no-tail-cache` | off | Never cache the final partial block (vLLM align mode *does* cache the prompt's partial tail) |
+
+Semantics, mirroring vLLM v1's `MambaManager`:
+
+- **Hit rule**: the reusable prefix is the *newest cached checkpoint* covered
+  by the KV prefix match (checkpoints are scanned right-to-left — an SSM
+  only needs the latest state to resume). No cached checkpoint → 0 hits,
+  even if all KV blocks are cached.
+- **Capacity**: one shared LRU pool measured in tokens. Each KV block entry
+  costs `block_size` tokens; each checkpoint costs `--mamba-state-size`
+  tokens. Convert state bytes to token-equivalents with:
+
+  ```
+  mamba_state_size = total_state_bytes_across_mamba_layers
+                     / total_kv_bytes_per_token_across_attn_layers
+  ```
+
+  e.g. Kimi-K3 (93 layers: 69 KDA + 24 MLA): per KDA layer the state is
+  `(3·96·128)·3·2 B` conv (bf16) + `96·128·128·4 B` recurrent (fp32)
+  = 6.21 MiB, so a checkpoint is 69 × 6.21 MiB ≈ 428.6 MiB; MLA KV is
+  24 × (512+64) × 2 B = 27,648 B/token → ≈ 16,253 tokens per checkpoint
+  (TP-invariant: state and KV both shrink with TP, so the ratio is
+  unchanged at TP8).
+
+Not modeled (second order for hit-rate estimation): the 2+spec resident
+blocks each in-flight request holds, and chunked-prefill boundary alignment.
+
+**Sizing the pool from a byte budget.** The simulator's capacity unit is
+"one token of attention KV across all layers", so:
+
+```
+--cache-capacity   = pool_budget_bytes / kv_bytes_per_token_all_layers
+--mamba-state-size = checkpoint_bytes_all_mamba_layers / kv_bytes_per_token_all_layers
+```
+
+e.g. K3 with FP8 MLA KV: 24 × 576 × 1 B = 13.5 KB/token → a 500 GiB pool is
+`500·2³⁰ / 13,824` = 38,838,136 tokens, and the 428.6 MiB checkpoint costs
+`449,372,160 / 13,824` = 32,507 tokens (vs 16,253 at bf16 KV — FP8 halves
+the KV currency, so the same state costs 2× more). One 1536-token align
+block then costs 1536 + 32,507 tokens ≈ 470.6 MB, 95% of which is state.
 
 ### `build_session_map.py`
 
